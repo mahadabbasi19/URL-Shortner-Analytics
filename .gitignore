@@ -16,3 +16,5 @@ backend/.coverage
 backend/.pytest_cache/
 htmlcov/
 .colima-data/
+loadtest/results_*.csv
+loadtest/results_*.html

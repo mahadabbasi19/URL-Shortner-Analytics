@@ -1,8 +1,8 @@
 # URL Shortener & Analytics Platform
 
-A production-style URL shortener and click-analytics platform, built the way a small SaaS product (think Bitly) would actually be engineered — not a CRUD tutorial. FastAPI + PostgreSQL + Redis on the backend, with a collision-resistant short-code generator, a cache-aside redirect path, and a React analytics dashboard.
+A production-style URL shortener and click-analytics platform, built the way a small SaaS product (think Bitly) would actually be engineered — not a CRUD tutorial. FastAPI + PostgreSQL + Redis on the backend, a React + TypeScript dashboard on the frontend, a collision-resistant short-code generator, a cache-aside redirect path, JWT auth with per-user authorization, Redis-backed rate limiting, and a background click-analytics pipeline with real SQL aggregation.
 
-This project is being built incrementally and documented as it goes. The sections below are marked **✅ Implemented** or **🚧 Planned** so this README never claims more than the code actually does.
+Every feature below has been run against a live Docker stack, not just unit-tested in isolation — see [Final Verification](#final-verification) for the full checklist and what was actually observed.
 
 ## Table of Contents
 
@@ -22,6 +22,7 @@ This project is being built incrementally and documented as it goes. The section
 - [Geolocation](#geolocation)
 - [Referrer & Device Analytics](#referrer--device-analytics)
 - [SQL Analytics](#sql-analytics)
+- [Frontend](#frontend)
 - [Error Handling](#error-handling)
 - [API Endpoints](#api-endpoints)
 - [Project Structure](#project-structure)
@@ -29,13 +30,17 @@ This project is being built incrementally and documented as it goes. The section
 - [Docker Setup](#docker-setup)
 - [Database Migrations](#database-migrations)
 - [Testing](#testing)
+- [Load Testing & Performance Results](#load-testing--performance-results)
+- [Security](#security)
 - [Privacy Considerations](#privacy-considerations)
-- [Roadmap](#roadmap)
+- [Scaling Strategy](#scaling-strategy)
 - [Trade-offs](#trade-offs)
+- [Future Improvements](#future-improvements)
+- [Final Verification](#final-verification)
 
 ## Overview
 
-A user submits a long URL and receives a short one. Visiting the short URL redirects to the original destination and records a click event for later analytics. The redirect path is the hottest, most latency-sensitive part of the system and is designed accordingly: a cache-aside Redis layer in front of PostgreSQL, with click analytics processed in the background, out of the request's critical path.
+A user submits a long URL and receives a short one. Visiting the short URL redirects to the original destination and records a click event for later analytics. The redirect path is the hottest, most latency-sensitive part of the system and is designed accordingly: a cache-aside Redis layer in front of PostgreSQL, with click analytics processed in the background, out of the request's critical path. A React dashboard on top lets a signed-in user create, manage, and analyze their own links, while anonymous creation and viewing remain fully supported for links that were never attached to an account.
 
 ## Features
 
@@ -64,42 +69,51 @@ A user submits a long URL and receives a short one. Visiting the short URL redir
 | Edit (`PATCH`) / delete (`DELETE`) URLs, with cache invalidation on change | ✅ |
 | QR code generation (`GET /api/v1/urls/{id}/qr`) | ✅ |
 | Redis-backed rate limiting, scoped per endpoint class | ✅ |
-| React analytics dashboard | 🚧 |
-| Load testing (Locust/k6) | 🚧 |
+| React + TypeScript dashboard (landing, auth, link management, per-link analytics with charts) | ✅ |
+| Load testing (Locust), cache-hit vs. cache-miss comparison with real measured numbers | ✅ |
+| `docs/system-design.md` — interview-style architecture writeup | ✅ |
 
 ## Technology Stack
 
 **Backend:** Python 3.12, FastAPI, SQLAlchemy 2.x, Pydantic v2, Alembic, PostgreSQL 16, Redis 7, pytest.
 
-**Frontend (planned):** React, TypeScript, Vite, Tailwind CSS, React Router, TanStack Query, Recharts.
+**Frontend:** React 19, TypeScript, Vite, Tailwind CSS v4, React Router, TanStack Query, Recharts, Axios.
 
-**Infrastructure:** Docker, Docker Compose, environment-variable configuration.
+**Infrastructure:** Docker, Docker Compose, environment-variable configuration, Locust for load testing.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    subgraph Client
-        Browser
+    Browser["Browser"]
+
+    subgraph Frontend["React + TypeScript (Vite)"]
+        UI["Pages & components"]
+        RQ["TanStack Query"]
     end
 
     subgraph Backend["FastAPI Backend"]
+        MW["Middleware\n(rate limiting)"]
         API["API Layer\n(routers)"]
         SVC["Service Layer\n(business logic)"]
         REPO["Repository Layer\n(SQL access)"]
     end
 
-    Redis[(Redis\ncache-aside · planned)]
+    Redis[(Redis\ncache-aside + rate limits)]
     PG[(PostgreSQL\nsystem of record)]
 
-    Browser -->|HTTP| API
+    Browser --> UI
+    UI --> RQ
+    RQ -->|HTTP + JWT| MW
+    MW --> API
     API --> SVC
     SVC --> REPO
     REPO --> PG
-    SVC -.->|planned| Redis
+    SVC --> Redis
+    MW --> Redis
 ```
 
-The backend follows a layered architecture: **routers** (`api/`) handle HTTP concerns only, **services** (`services/`) hold business logic (short-code generation, validation rules), and **repositories** (`repositories/`) isolate SQLAlchemy query-building so services stay testable without a real database query in every unit test.
+The backend follows a layered architecture: **routers** (`api/`) handle HTTP concerns only, **services** (`services/`) hold business logic (short-code generation, validation rules), **repositories** (`repositories/`) isolate SQLAlchemy query-building so services stay testable without a real database query in every unit test, and **middleware** (`middleware/`) holds cross-cutting concerns (rate limiting) applied as FastAPI dependencies rather than scattered through route handlers. The frontend is a standard client-server SPA — it never talks to Postgres or Redis directly, only through the same REST API a `curl` command would use.
 
 ## Request Lifecycle
 
@@ -341,6 +355,23 @@ All aggregation happens in PostgreSQL (`app/repositories/click_event_repository.
 
 All of the above accept an optional `[start, end]` UTC range, applied as `clicked_at >= start` / `clicked_at <= end` — which is exactly what `ix_click_events_url_id_clicked_at` (see [PostgreSQL Indexing](#postgresql-indexing)) is built to serve efficiently: an index range scan on the leading `url_id` equality plus the `clicked_at` range, with no separate sort needed for the time-series query.
 
+## Frontend
+
+A React 19 + TypeScript SPA (`frontend/`), built with Vite and styled with Tailwind CSS v4 — a dark, minimal SaaS aesthetic (deliberately not a default-Bootstrap look), consistent typography (Inter), and real loading/empty/error states on every data-driven view rather than blank screens.
+
+**Pages:**
+- **Landing** (`/`) — product pitch plus a fully working anonymous "shorten a link" card, so the core feature is usable with zero signup friction.
+- **Login / Register** (`/login`, `/register`) — JWT auth against the real backend; the token is stored in `localStorage` and attached to every request via an Axios interceptor.
+- **Dashboard** (`/dashboard`, protected) — aggregate stats (total links, total clicks, active links) computed from the user's own link list, a quick-create card, and a "recent links" table.
+- **My Links** (`/links`, protected) — the full link list: create, copy, open, view QR, disable/enable, delete (two-step confirm, not a native `window.confirm`), each backed by the corresponding API call and an optimistic-refetch via TanStack Query cache invalidation.
+- **Link Analytics** (`/links/:id`, protected) — per-link detail: status, total/unique/today's clicks, a clicks-over-time area chart (Recharts), and top-N bar lists for referrers, countries, cities, browsers, OS, and devices, all sourced from `GET /api/v1/urls/{id}/analytics` with a 24h/7d/30d/all-time range picker.
+
+**State management:** TanStack Query owns all server state (URLs, analytics, the current user) — no separate global store duplicating what the API already returns. A small `AuthContext` wraps it to expose `login`/`register`/`logout` and the current user to the rest of the tree. Browser `localStorage` is used only for the JWT itself (a per-device convenience, not shared state), matching the guidance that persistent/shared state belongs server-side.
+
+**Auth-aware fetching for non-JSON responses:** the QR code endpoint requires a bearer token, so it can't be used directly as an `<img src>` (no way to attach a header to an image tag's request). The frontend fetches it as a blob via Axios (which does carry the auth header) and renders it through a local `URL.createObjectURL`, revoked on unmount.
+
+**Verified:** `tsc --noEmit` (no type errors), `vite build` (production bundle builds cleanly), and the Dockerized dev server serves the app and reaches the backend — confirmed via `docker compose up` and `curl`. Every API call in the frontend was cross-checked against the actual backend route signatures. A live, interactive click-through in a real browser was not available in the environment this was built in (no browser automation tool was attached to this session) — that manual pass is worth doing before treating the UI as fully signed off.
+
 ## Error Handling
 
 All application errors return a consistent envelope instead of a stack trace:
@@ -396,13 +427,24 @@ url-shortener/
 │   │   ├── schemas/               # Pydantic request/response models
 │   │   ├── services/              # Business logic (short-code generation, validation)
 │   │   ├── repositories/          # SQL query access, isolated from business logic
-│   │   ├── middleware/            # (planned: rate limiting)
-│   │   ├── utils/                 # Base62 generation, reserved-alias list
+│   │   ├── middleware/            # Rate-limiting dependencies
+│   │   ├── utils/                 # Base62 generation, reserved-alias list, referrer/UA parsing
 │   │   └── tests/                 # pytest suite
 │   ├── alembic/                   # Migration environment + versions
 │   ├── requirements.txt
 │   └── Dockerfile
-├── frontend/                      # (planned — Phase 7)
+├── frontend/
+│   ├── src/
+│   │   ├── pages/                 # Landing, Login, Register, Dashboard, MyLinks, LinkAnalytics
+│   │   ├── components/            # Layout, CreateLinkCard, LinksTable, charts, etc.
+│   │   ├── hooks/                 # useUrls (TanStack Query)
+│   │   ├── lib/                   # api.ts (Axios client), auth.tsx (AuthContext)
+│   │   └── types.ts               # Types mirroring the backend's Pydantic schemas
+│   ├── package.json
+│   └── Dockerfile
+├── loadtest/                      # Locust load test + measured results
+├── docs/
+│   └── system-design.md
 ├── docker-compose.yml
 ├── .env.example
 └── README.md
@@ -417,24 +459,26 @@ git clone https://github.com/mahadabbasi19/URL-Shortner-Analytics.git
 cd URL-Shortner-Analytics
 cp .env.example .env
 
-# Start Postgres + Redis + backend
-docker compose up -d postgres redis backend
+# Start everything: Postgres, Redis, backend, frontend
+docker compose up -d
 
 # Migrations run automatically on backend startup (see docker-compose.yml).
 # Verify:
 curl http://localhost:8000/health
+open http://localhost:5173   # the dashboard
+open http://localhost:8000/docs   # interactive API docs
 ```
 
 ## Docker Setup
 
-`docker-compose.yml` defines four services (`frontend` is a placeholder until Phase 7):
+`docker-compose.yml` defines four services:
 
 - **postgres** — Postgres 16, persisted via a named volume, with a `pg_isready` healthcheck.
 - **redis** — Redis 7, with a `redis-cli ping` healthcheck.
 - **backend** — builds from `backend/Dockerfile`, waits for both dependencies to report healthy, runs `alembic upgrade head`, then starts `uvicorn --reload`.
-- **frontend** — reserved for the Phase 7 React app.
+- **frontend** — builds from `frontend/Dockerfile`, runs the Vite dev server (`--host`, so it's reachable from outside the container), talks to the backend via `VITE_API_BASE_URL`.
 
-No secrets are baked into the image or compose file — everything comes from `.env` (copy `.env.example` and edit for local dev; never commit a real `.env`).
+No secrets are baked into any image or the compose file — everything comes from `.env` (copy `.env.example` and edit for local dev; never commit a real `.env`).
 
 ## Database Migrations
 
@@ -467,6 +511,34 @@ Current coverage (77 tests):
 
 Tests run against the same PostgreSQL instance as local dev, each wrapped in an outer transaction (`join_transaction_mode="create_savepoint"`) that's rolled back afterward — so application code under test can call `db.commit()` freely (as the redirect endpoint does) without any of it surviving past the test. The `client` fixture (in `conftest.py`, shared by every test module) always overrides both `get_db` *and* `get_redis` with the test's isolated, per-test-flushed instances — a lesson learned during this phase, when a rate-limit test suite exposed that a couple of test files had been overriding only `get_db`, letting their requests hit the real, unflushed Redis connection and silently share rate-limit counters with unrelated tests.
 
+## Load Testing & Performance Results
+
+`loadtest/locustfile.py` drives the redirect endpoint under two scenarios in the same run — cache-hit (a URL requested repeatedly) and cache-miss (a brand-new URL requested exactly once, guaranteeing a Postgres round-trip). Full instructions and the actual measured numbers (20 concurrent users, 30s, zero failures across 5,298 requests, run on this exact codebase on 2026-09-28) are in [`loadtest/README.md`](loadtest/README.md) — summarized:
+
+| Metric | Cache-hit | Cache-miss |
+|---|---|---|
+| Median (p50) | 2 ms | 3 ms |
+| p99 | 8 ms | 8 ms |
+| Throughput | 110 req/s | 36 req/s |
+| Errors | 0% | 0% |
+
+These numbers were measured, not estimated — see the load test README for the honest caveat about what a same-machine topology does and doesn't prove.
+
+## Security
+
+- **Passwords:** bcrypt via `passlib`, never logged or returned in any API response.
+- **JWT:** `HS256`, secret from `JWT_SECRET` (never hardcoded — see `.env.example`), 60-minute default expiry.
+- **SQL injection:** not reachable — every query goes through SQLAlchemy's parameterized query builder; there is no raw string-interpolated SQL anywhere in the codebase.
+- **XSS:** the API returns JSON exclusively; there is no server-rendered HTML that could reflect untrusted input. The frontend is a React SPA, which escapes interpolated content by default.
+- **Open-redirect / malicious URLs:** `original_url` is validated to start with `http://` or `https://` and rejects other schemes (e.g. `javascript:`, `file:`) at the Pydantic validation layer, before it's ever persisted or redirected to.
+- **Authorization:** every owner-only endpoint checks `url.user_id == current_user.id` explicitly (`app/api/v1/urls.py`'s `_get_owned_url`) rather than relying on "the ID is hard to guess" — verified by tests and a live cross-account check (see [Final Verification](#final-verification)).
+- **Rate limiting:** see [Rate Limiting](#rate-limiting) — anonymous creation, authenticated creation, login, analytics, and redirects each have independent, configurable limits; login is specifically brute-force-resistant (10 attempts / 5 minutes per IP).
+- **CORS:** the backend only allows the configured `FRONTEND_URL` origin, not `*`.
+- **Secrets management:** `.env` is git-ignored; `.env.example` documents every variable with clearly-fake placeholder values; nothing is baked into a Docker image.
+- **Reserved aliases:** a fixed list (`api`, `admin`, `login`, `health`, …) prevents a custom alias from shadowing a real application route.
+- **Sensitive logging:** passwords, JWTs, and raw IP addresses are never written to logs (see [Privacy Considerations](#privacy-considerations) for the IP handling specifically).
+- **Known limitation — trusted proxy handling:** the redirect/rate-limit code currently reads the connecting socket's IP directly (`request.client.host`), not an `X-Forwarded-For` header. Behind a real reverse proxy or load balancer, this would need explicit trusted-proxy configuration (only honor `X-Forwarded-For` from a known proxy IP) to avoid a client spoofing their apparent IP to evade rate limiting — not needed for local Docker Compose, but flagged here rather than silently assumed away.
+
 ## Privacy Considerations
 
 - **Raw IP addresses are never persisted.** The IP seen by the redirect handler is used only in-memory, for two purposes: a GeoIP lookup (to resolve country/region/city) and computing `visitor_hash`. The IP itself never reaches the `click_events` table.
@@ -475,17 +547,54 @@ Tests run against the same PostgreSQL instance as local dev, each wrapped in an 
 - **`user_agent`** (the full raw string) is stored as-is for debugging/parsing-improvement purposes; it's not linked to any account identity in the schema, since `click_events` has no `user_id`.
 - **No third-party analytics/tracking scripts** are involved — all analytics are first-party, computed from the server's own request handling.
 
-## Roadmap
+## Scaling Strategy
 
-The remaining phases, in build order:
+The full write-up — functional/non-functional requirements, why each technology was chosen, indexing strategy, every documented failure scenario, and consistency trade-offs — lives in [`docs/system-design.md`](docs/system-design.md), written as an interview-style architecture discussion. Short version of the scaling path:
 
-1. **React dashboard** — landing page, auth flows, link management, analytics visualizations.
-2. **Quality pass** — load testing (Locust/k6) comparing cache-hit vs. cache-miss latency, `docs/system-design.md`, final end-to-end verification.
+**What's implemented today:** a stateless FastAPI backend (any number of instances could run behind a load balancer with zero code changes), one Postgres instance as the system of record, one Redis instance for cache-aside + rate limiting, and in-process `BackgroundTasks` for analytics enrichment.
 
-Each phase is verified (migrations run, tests pass, manual smoke test) before moving to the next, and this README is updated alongside the code rather than after the fact.
+**What would come next, if volume ever justified it** (none of this is built — building it now would be solving a problem this project doesn't have): a load balancer in front of multiple API instances, Redis Cluster, Postgres read replicas for analytics queries specifically, connection pooling (PgBouncer), a real event queue (Kafka/SQS/Redis Streams) between the redirect service and analytics processing, dedicated analytics workers scaled independently, partitioned `click_events`, and CDN/edge redirects for the highest-traffic links.
 
 ## Trade-offs
 
-- **FastAPI `BackgroundTasks` over Kafka/Celery for analytics** (planned): the redirect response should not wait on analytics enrichment, but a full message queue is unjustified complexity at this stage. The upgrade path (`Redirect Service → Event Queue → Analytics Workers`) is documented for when volume actually demands it.
+- **FastAPI `BackgroundTasks` over Kafka/Celery for analytics:** the redirect response should not wait on analytics enrichment, but a full message queue is unjustified complexity at this project's actual scale. The upgrade path (`Redirect Service → Event Queue → Analytics Workers`) is documented in `docs/system-design.md` for when volume actually demands it.
 - **Denormalized `total_clicks` on `urls`** alongside the authoritative `click_events` table: a small consistency/write-cost trade for avoiding a `COUNT(*)` on every dashboard list render.
 - **Anonymous URL creation is allowed** (`urls.user_id` is nullable): matches how Bitly-style tools actually work — auth is additive, not a hard requirement to use the core product.
+- **Fixed-window rate limiting over sliding-window/token-bucket:** simpler and cheaper per request, at the cost of allowing up to ~2x the nominal limit through across a window boundary in the worst case — an acceptable bound for anti-abuse limits at this scale (full reasoning in [Rate Limiting](#rate-limiting)).
+- **No dedicated dashboard-summary endpoint:** the frontend's Dashboard page computes its stat cards (total links, total clicks, active count) client-side from the existing `GET /api/v1/urls` list rather than adding a new backend endpoint that would just be a thin aggregation wrapper — the list already contains everything needed, and a real cross-link, cross-time aggregation belongs in the per-link Analytics page where the SQL-backed `clicks_over_time` already lives.
+
+## Future Improvements
+
+Honest list of what a next iteration would tackle, roughly in priority order:
+
+1. **A dedicated `X-Forwarded-For`-aware IP extraction** for real reverse-proxy deployments (see the Security section's noted limitation).
+2. **Refresh tokens / token revocation** — the current JWT has no revocation mechanism short of waiting out its 60-minute expiry; a refresh-token flow or a Redis-backed denylist would close that gap.
+3. **Cursor-based pagination** for `GET /api/v1/urls` — currently offset/limit, which is fine at this scale but degrades on very large lists.
+4. **A dedicated `dashboard summary` endpoint** if the frontend's client-side aggregation ever needs to span more data than a single page of results comfortably holds.
+5. **The scaling-path items in `docs/system-design.md` §6**, if/when real traffic volume justified them.
+6. A real interactive browser click-through of the frontend (see the note in [Frontend](#frontend)) — everything has been verified by type-checking, a production build, and API-contract cross-referencing, but nothing replaces actually clicking through the UI in a real browser.
+
+## Final Verification
+
+The full end-to-end scenario was run against a live Docker Compose stack (not asserted from reading the code) on 2026-09-28:
+
+| # | Check | Result |
+|---|---|---|
+| 1-2 | Register, then log in | ✅ `201`, then a JWT returned |
+| 3 | Create a short URL | ✅ `201` with a valid `short_code` |
+| 4-9 | Visit the short URL, redirect succeeds | ✅ `302` to the original URL |
+| 10 | Redis cache becomes populated | ✅ confirmed via `redis-cli GET url:<code>` |
+| 11 | Repeat visit is a cache hit | ✅ `302`, no Postgres query needed |
+| 12-13 | Click event recorded, analytics update | ✅ `total_clicks`/`clicks_today` incremented, referrer/browser/OS/device populated |
+| 17 | Custom alias works | ✅ `201`, `short_code` == the requested alias |
+| 18 | Duplicate alias is rejected | ✅ `409 conflict` |
+| 19 | Expired URL is rejected | ✅ `410 gone` |
+| 20 | Disabled URL is rejected | ✅ `PATCH` to disable → `410` on next redirect |
+| 21 | QR code works | ✅ `200`, `image/png`, valid PNG bytes |
+| 22 | Rate limiter returns 429 | ✅ 10 login attempts allowed, 11th+ get `429` with a correct `Retry-After` |
+| 23 | Unauthorized access is rejected | ✅ `401` with no token on an owner-only endpoint |
+| 24 | One user cannot access another user's analytics | ✅ `403` on a second account's token |
+| 25 | Tests pass | ✅ 77/77, `docker compose exec backend pytest app/tests/` |
+| 26 | Docker environment works | ✅ all four services (`postgres`, `redis`, `backend`, `frontend`) healthy/running via `docker compose up -d` |
+
+Steps 14-16 (referrer/device/geo info populate "when provided") are covered by the analytics pipeline verification in steps 12-13 and by the dedicated referrer/UA/geo test suites — a real browser's `Referer` and `User-Agent` headers populate those fields exactly as `curl -H` did here.
