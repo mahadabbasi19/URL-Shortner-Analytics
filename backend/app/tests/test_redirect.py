@@ -1,22 +1,9 @@
-import pytest
-from fastapi.testclient import TestClient
 from redis import Redis as RedisClient
 
-from app.core.database import get_db
 from app.core.redis_client import get_redis
 from app.main import app
 from app.schemas.url import URLCreate
 from app.services.shortener_service import ShortenerService
-
-
-@pytest.fixture
-def client(db, redis_client):
-    app.dependency_overrides[get_db] = lambda: db
-    app.dependency_overrides[get_redis] = lambda: redis_client
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
-
 
 def test_redirect_populates_cache_on_miss_then_hits_it(client, db, settings, redis_client):
     service = ShortenerService(db, settings)

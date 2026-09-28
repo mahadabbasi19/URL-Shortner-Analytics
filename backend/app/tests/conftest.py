@@ -1,9 +1,11 @@
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.database import engine
+from app.core.database import engine, get_db
 from app.core.redis_client import get_redis
+from app.main import app
 
 
 @pytest.fixture
@@ -44,3 +46,20 @@ def redis_client():
     client.flushdb()
     yield client
     client.flushdb()
+
+
+@pytest.fixture
+def client(db, redis_client):
+    """A TestClient wired to this test's isolated db/redis fixtures, shared
+    across every test module. Centralized deliberately: a per-file client
+    fixture that forgets to override get_redis lets that test's requests
+    hit the real, unflushed Redis connection — which silently pollutes
+    shared state like rate-limit counters across unrelated tests run in
+    the same suite. One fixture, always fully isolated, avoids that class
+    of flaky cross-test failure entirely.
+    """
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_redis] = lambda: redis_client
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()

@@ -1,26 +1,11 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
-import pytest
-from fastapi.testclient import TestClient
-
-from app.core.database import get_db
-from app.core.redis_client import get_redis
-from app.main import app
 from app.models.click_event import ClickEvent
 from app.schemas.url import URLCreate
 from app.services import click_recording_service
 from app.services.analytics_service import AnalyticsService
 from app.services.shortener_service import ShortenerService
-
-
-@pytest.fixture
-def client(db):
-    app.dependency_overrides[get_db] = lambda: db
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
-
 
 def _make_click(db, url_id, **overrides) -> ClickEvent:
     defaults = dict(
@@ -111,7 +96,6 @@ def test_full_redirect_to_analytics_pipeline(client, db, settings, redis_client,
     returning, so by the time we check analytics, the click is recorded.
     """
     monkeypatch.setattr(click_recording_service, "SessionLocal", lambda: db)
-    app.dependency_overrides[get_redis] = lambda: redis_client
 
     service = ShortenerService(db, settings)
     url = service.create_url(URLCreate(original_url="https://example.com/e2e"), user_id=None)

@@ -12,6 +12,7 @@ from app.core.config import Settings, get_settings
 from app.core.database import get_db
 from app.core.exceptions import GoneError
 from app.core.redis_client import get_redis
+from app.middleware.rate_limit import rate_limit_by_ip
 from app.repositories.url_repository import URLRepository
 from app.services.cache_service import CacheService
 from app.services.click_recording_service import record_click
@@ -36,7 +37,7 @@ def _schedule_click_recording(background_tasks: BackgroundTasks, request: Reques
     )
 
 
-@router.get("/{short_code}")
+@router.get("/{short_code}", dependencies=[Depends(rate_limit_by_ip("rate_limit_redirect"))])
 def redirect_to_original(
     short_code: str,
     request: Request,

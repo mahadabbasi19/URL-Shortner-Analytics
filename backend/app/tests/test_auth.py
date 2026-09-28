@@ -1,18 +1,3 @@
-import pytest
-from fastapi.testclient import TestClient
-
-from app.core.database import get_db
-from app.main import app
-
-
-@pytest.fixture
-def client(db):
-    app.dependency_overrides[get_db] = lambda: db
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
-
-
 def test_register_creates_user(client):
     resp = client.post("/api/v1/auth/register", json={"email": "alice@example.com", "password": "supersecret"})
 

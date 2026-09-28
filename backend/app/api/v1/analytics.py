@@ -7,12 +7,17 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import get_current_user_optional
 from app.core.exceptions import ForbiddenError, NotFoundError
+from app.middleware.rate_limit import rate_limit_by_ip
 from app.models.user import User
 from app.repositories.url_repository import URLRepository
 from app.schemas.analytics import URLAnalyticsResponse
 from app.services.analytics_service import AnalyticsService
 
-router = APIRouter(prefix="/api/v1/urls", tags=["Analytics"])
+router = APIRouter(
+    prefix="/api/v1/urls",
+    tags=["Analytics"],
+    dependencies=[Depends(rate_limit_by_ip("rate_limit_analytics"))],
+)
 
 
 def _to_range_bounds(start_date: date | None, end_date: date | None) -> tuple[datetime | None, datetime | None]:

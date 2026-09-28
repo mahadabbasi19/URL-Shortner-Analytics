@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings, get_settings
 from app.core.database import get_db
 from app.core.deps import get_current_user
+from app.middleware.rate_limit import rate_limit_by_ip
 from app.models.user import User
 from app.schemas.user import TokenResponse, UserCreate, UserLogin, UserResponse
 from app.services.auth_service import AuthService
@@ -24,7 +25,7 @@ def register(
     return UserResponse.model_validate(user)
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=TokenResponse, dependencies=[Depends(rate_limit_by_ip("rate_limit_auth_login"))])
 def login(
     payload: UserLogin,
     db: Session = Depends(get_db),

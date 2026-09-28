@@ -15,6 +15,8 @@ This project is being built incrementally and documented as it goes. The section
 - [Short-Code Generation & Collision Handling](#short-code-generation--collision-handling)
 - [PostgreSQL Indexing](#postgresql-indexing)
 - [Redis Caching](#redis-caching)
+- [URL Management & QR Codes](#url-management--qr-codes)
+- [Rate Limiting](#rate-limiting)
 - [Authentication & Authorization](#authentication--authorization)
 - [Analytics Pipeline](#analytics-pipeline)
 - [Geolocation](#geolocation)
@@ -59,8 +61,9 @@ A user submits a long URL and receives a short one. Visiting the short URL redir
 | Analytics API + SQL aggregation (`GET /api/v1/urls/{id}/analytics`) | ✅ |
 | JWT authentication (register/login/me) | ✅ |
 | Per-user URL ownership & authorization (list/view/analytics restricted to owner) | ✅ |
-| Redis-backed rate limiting | 🚧 |
-| QR code generation | 🚧 |
+| Edit (`PATCH`) / delete (`DELETE`) URLs, with cache invalidation on change | ✅ |
+| QR code generation (`GET /api/v1/urls/{id}/qr`) | ✅ |
+| Redis-backed rate limiting, scoped per endpoint class | ✅ |
 | React analytics dashboard | 🚧 |
 | Load testing (Locust/k6) | 🚧 |
 
@@ -244,10 +247,39 @@ Cache-aside, implemented in `app/services/cache_service.py` and wired into `GET 
 - **Value:** a small JSON payload — `id`, `original_url`, `is_active`, `expires_at` — deliberately not the full row (no `title`, `user_id`, etc.), since those fields are never needed to serve a redirect.
 - **TTL:** `REDIRECT_CACHE_TTL_SECONDS` (default 3600s / 1 hour).
 - **Population:** only on a cache miss, and only for links that pass `is_link_usable()` — an expired or disabled link is never written to the cache, so a bad entry can't outlive its own validity check.
-- **Validation on every hit:** the cached `is_active`/`expires_at` are re-checked on every request, not trusted blindly. This bounds the "stale cache" risk: even though nothing currently invalidates the cache on edit/disable (those endpoints don't exist yet — Phase 6), a link disabled *after* being cached would still be caught up to TTL expiry by whichever check runs first. Once edit/disable endpoints exist, they will call `CacheService.invalidate()` to remove the stale key immediately rather than waiting out the TTL.
+- **Validation on every hit:** the cached `is_active`/`expires_at` are re-checked on every request, not trusted blindly. This bounds the "stale cache" risk within the TTL window even before any explicit invalidation.
+- **Invalidation:** `PATCH /api/v1/urls/{id}` and `DELETE /api/v1/urls/{id}` both call `CacheService.invalidate()` immediately after committing the change — a link disabled or deleted stops resolving on the very next request, rather than waiting out the TTL. Verified with a live test: warm the cache, disable the link, confirm the Redis key is gone *and* the next redirect returns 410.
 - **Failure mode:** every `CacheService` method catches `redis.RedisError` internally and returns/no-ops rather than raising. A Redis outage means every request pays a full Postgres round-trip (cache-miss cost, permanently) — slower, never broken.
 
 **Why cache-aside over a write-through or read-through cache:** the redirect path reads far more than it writes (one `INSERT` per link creation, many `GET`s per link over its lifetime), and Postgres must remain authoritative regardless of Redis's state — cache-aside is the standard fit for that access pattern and keeps Redis strictly optional.
+
+## URL Management & QR Codes
+
+All under `app/api/v1/urls.py`, owner-only (via `get_current_user` + an ownership check shared by every route as `_get_owned_url`):
+
+- **`PATCH /api/v1/urls/{id}`** — partial update. Uses Pydantic's `exclude_unset=True` so only fields actually present in the request body are applied; omitting `is_active` from the payload can never accidentally flip it back on. Any actual change invalidates the cache entry (see above).
+- **`DELETE /api/v1/urls/{id}`** — hard delete (cascades to that URL's `click_events` via the FK's `ondelete="CASCADE"`), `204 No Content`, and invalidates the cache entry so the short code stops resolving immediately rather than continuing to serve from a stale cache until TTL.
+- **`GET /api/v1/urls/{id}/qr`** — a PNG QR code encoding the link's short URL, generated on demand (`qrcode` library) rather than precomputed and stored at creation time. Most links are never viewed as a QR code, so generating on request avoids doing that work for every single `POST /api/v1/urls` call.
+
+## Rate Limiting
+
+Redis-backed, fixed-window, implemented in `app/services/rate_limit_service.py` (the algorithm) and `app/middleware/rate_limit.py` (the per-endpoint FastAPI dependencies).
+
+**Algorithm:** `INCR` a counter keyed by `ratelimit:{scope}:{identifier}`; on the first hit in a window, `EXPIRE` it to the window length; once the count exceeds the limit, reject with `429` and `Retry-After` set to the key's remaining TTL. State lives in Redis, not process memory, so the limit holds correctly across multiple backend instances behind a load balancer — a requirement the README's own architecture section anticipates. **Trade-off vs. alternatives:** fixed window is simple and cheap (one `INCR`, one conditional `EXPIRE`), but it can let roughly 2x the nominal limit through across a window boundary (a burst at the end of one window plus a burst at the start of the next). A sliding-window-log (a Redis sorted set of timestamps) or token-bucket (continuous refill, controlled bursts) algorithm avoids that at the cost of more Redis state and computation per check. For anti-abuse limits at this project's scale, bounding worst-case abuse to ~2x the stated number is the right trade for the simpler implementation.
+
+**Scopes** (each independently configurable via `.env`, `count/window_seconds`):
+
+| Scope | Default | Keyed by | Applied to |
+|---|---|---|---|
+| Anonymous URL creation | 10/hour | Client IP | `POST /api/v1/urls` (no auth) |
+| Authenticated URL creation | 100/hour | User id | `POST /api/v1/urls` (with auth) — deliberately a *separate* bucket from the anonymous limit, verified by a test that exhausts the anonymous quota and confirms an authenticated request from the same client still succeeds |
+| Login | 10/5 min | Client IP | `POST /api/v1/auth/login` — brute-force protection |
+| Analytics reads | 120/min | Client IP | `GET /api/v1/urls/{id}/analytics` |
+| Redirects | 300/min | Client IP | `GET /{short_code}` |
+
+**Fails open:** any `RedisError` during a check allows the request through rather than rejecting it — an outage in the rate limiter must not become an outage of the product itself (same fail-soft principle as `CacheService`).
+
+Verified live: hammering `POST /api/v1/auth/login` with wrong credentials returns `401` for the first 10 attempts, then `429` with a correct `Retry-After` header from the 11th attempt onward, within the configured 5-minute window.
 
 ## Authentication & Authorization
 
@@ -328,22 +360,26 @@ All application errors return a consistent envelope instead of a stack trace:
 | Missing/invalid/expired auth token | 401 | `unauthorized` |
 | Wrong password / unknown email at login | 401 | `unauthorized` |
 | Authenticated but not the resource's owner | 403 | `forbidden` |
+| Rate limit exceeded | 429 | `rate_limited` (with `Retry-After` header) |
 | Unhandled server error | 500 | `internal_error` (no internals leaked) |
 
 ## API Endpoints
 
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `POST` | `/api/v1/auth/register` | — | Create a user account. |
-| `POST` | `/api/v1/auth/login` | — | Exchange email/password for a JWT. |
-| `GET` | `/api/v1/auth/me` | required | Current user's profile. |
-| `POST` | `/api/v1/urls` | optional | Create a short URL. Attributed to the caller if authenticated, anonymous otherwise. |
-| `GET` | `/api/v1/urls` | required | List the authenticated user's URLs. |
-| `GET` | `/api/v1/urls/{id}` | required | View one URL's detail. 403 if you're not the owner. |
-| `GET` | `/{short_code}` | — | Resolve and redirect (302) to the original URL; schedules background click recording. |
-| `GET` | `/api/v1/urls/{id}/analytics` | optional | Aggregated click analytics. Optional `start_date`/`end_date` (UTC, inclusive). Public for anonymously-created URLs; owner-only otherwise. |
-| `GET` | `/health` | — | Liveness/readiness — reports PostgreSQL and Redis status independently. |
-| `GET` | `/docs` | — | Interactive Swagger/OpenAPI documentation. |
+| Method | Path | Auth | Rate limit | Description |
+|---|---|---|---|---|
+| `POST` | `/api/v1/auth/register` | — | — | Create a user account. |
+| `POST` | `/api/v1/auth/login` | — | 10/5min per IP | Exchange email/password for a JWT. |
+| `GET` | `/api/v1/auth/me` | required | — | Current user's profile. |
+| `POST` | `/api/v1/urls` | optional | 10/hr anon · 100/hr auth | Create a short URL. Attributed to the caller if authenticated, anonymous otherwise. |
+| `GET` | `/api/v1/urls` | required | — | List the authenticated user's URLs. |
+| `GET` | `/api/v1/urls/{id}` | required | — | View one URL's detail. 403 if you're not the owner. |
+| `PATCH` | `/api/v1/urls/{id}` | required | — | Partial update (title/expiry/active). Owner-only; invalidates the cache. |
+| `DELETE` | `/api/v1/urls/{id}` | required | — | Delete a URL. Owner-only; invalidates the cache. |
+| `GET` | `/api/v1/urls/{id}/qr` | required | — | PNG QR code for the URL's short link. Owner-only. |
+| `GET` | `/{short_code}` | — | 300/min per IP | Resolve and redirect (302) to the original URL; schedules background click recording. |
+| `GET` | `/api/v1/urls/{id}/analytics` | optional | 120/min per IP | Aggregated click analytics. Optional `start_date`/`end_date` (UTC, inclusive). Public for anonymously-created URLs; owner-only otherwise. |
+| `GET` | `/health` | — | — | Liveness/readiness — reports PostgreSQL and Redis status independently. |
+| `GET` | `/docs` | — | — | Interactive Swagger/OpenAPI documentation. |
 
 Full interactive docs are available at `http://localhost:8000/docs` once the backend is running.
 
@@ -417,7 +453,7 @@ The initial migration (`4909c0ae0e73`) creates `users`, `urls`, and `click_event
 docker compose exec backend pytest app/tests/ -v
 ```
 
-Current coverage (62 tests):
+Current coverage (77 tests):
 - **Shortener:** creation with a generated code, custom-alias creation, reserved-alias rejection, duplicate-alias conflict, collision retry (mocked to force two collisions before success), retry exhaustion, resolution for missing/expired/disabled links.
 - **Cache:** set/get round-trip, miss, invalidate, TTL is applied correctly, graceful fallback when Redis raises on GET or SETEX, corrupt cache entries are ignored rather than crashing.
 - **Redirect (integration, via `TestClient`):** cache populated on miss and served on hit, `total_clicks` increments on both paths, 404 for missing codes, 410 for expired/disabled links (and confirms they're never cached), and a full request succeeds even when Redis is unreachable.
@@ -426,8 +462,10 @@ Current coverage (62 tests):
 - **Analytics:** SQL aggregation correctness (total/unique/top-N/date-filtering) at the service layer, `404` for a nonexistent URL, and a full redirect → background-task → analytics-query round trip confirming the whole pipeline end to end.
 - **Auth:** registration (including duplicate-email conflict and password-length validation), login (correct/wrong password, unknown email), `/me` with no/garbage/valid tokens.
 - **Authorization:** anonymous creation still works; authenticated creation attaches ownership and shows up in "my URLs"; a second user gets 403 on another user's URL detail and analytics; anonymous URLs' analytics stay publicly readable; unauthenticated callers get 401 on owner-only endpoints. Also verified live against the running stack with two real accounts.
+- **URL management:** owner can disable/edit/delete their own URL; a non-owner gets 403 on update, delete, and QR generation; disabling or deleting immediately invalidates the Redis cache (verified by warming the cache, mutating the URL, and confirming both the cache key is gone *and* the next redirect reflects the change) rather than waiting out the TTL; QR endpoint returns a real PNG (magic-byte checked).
+- **Rate limiting:** allowed-within-limit, blocked-once-exceeded, resets after the window elapses, fails open on a Redis error, a real `429` from the login endpoint with a tight limit override, and anonymous/authenticated creation quotas are confirmed to be independent buckets.
 
-Tests run against the same PostgreSQL instance as local dev, each wrapped in an outer transaction (`join_transaction_mode="create_savepoint"`) that's rolled back afterward — so application code under test can call `db.commit()` freely (as the redirect endpoint does) without any of it surviving past the test. Redis-backed tests use a real Redis connection, flushed before and after each test.
+Tests run against the same PostgreSQL instance as local dev, each wrapped in an outer transaction (`join_transaction_mode="create_savepoint"`) that's rolled back afterward — so application code under test can call `db.commit()` freely (as the redirect endpoint does) without any of it surviving past the test. The `client` fixture (in `conftest.py`, shared by every test module) always overrides both `get_db` *and* `get_redis` with the test's isolated, per-test-flushed instances — a lesson learned during this phase, when a rate-limit test suite exposed that a couple of test files had been overriding only `get_db`, letting their requests hit the real, unflushed Redis connection and silently share rate-limit counters with unrelated tests.
 
 ## Privacy Considerations
 
@@ -441,10 +479,8 @@ Tests run against the same PostgreSQL instance as local dev, each wrapped in an 
 
 The remaining phases, in build order:
 
-1. **Advanced URL features** — QR codes, enable/disable/edit flows exposed via API (and wiring `CacheService.invalidate()` into them).
-2. **Redis-backed rate limiting**, scoped differently per endpoint class.
-3. **React dashboard** — landing page, auth flows, link management, analytics visualizations.
-4. **Quality pass** — expanded test coverage, load testing (Locust/k6) comparing cache-hit vs. cache-miss latency, `docs/system-design.md`.
+1. **React dashboard** — landing page, auth flows, link management, analytics visualizations.
+2. **Quality pass** — load testing (Locust/k6) comparing cache-hit vs. cache-miss latency, `docs/system-design.md`, final end-to-end verification.
 
 Each phase is verified (migrations run, tests pass, manual smoke test) before moving to the next, and this README is updated alongside the code rather than after the fact.
 
