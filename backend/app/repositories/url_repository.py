@@ -1,10 +1,10 @@
 import uuid
-from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.url import URL
+from app.utils.link_status import is_link_usable
 
 
 class URLRepository:
@@ -49,13 +49,5 @@ class URLRepository:
             url.total_clicks += 1
 
     @staticmethod
-    def is_usable(url: URL, now: datetime | None = None) -> bool:
-        """A link is usable when active and not expired. Centralized here so
-        the redirect path and the create/edit validation agree on the rule.
-        """
-        if not url.is_active:
-            return False
-        if url.expires_at is None:
-            return True
-        now = now or datetime.now(timezone.utc)
-        return url.expires_at > now
+    def is_usable(url: URL) -> bool:
+        return is_link_usable(url.is_active, url.expires_at)

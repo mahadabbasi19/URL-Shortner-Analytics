@@ -1,4 +1,6 @@
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -15,10 +17,19 @@ configure_logging()
 logger = logging.getLogger("app.main")
 settings = get_settings()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    logger.info("Application starting up | environment=%s", settings.environment)
+    yield
+    logger.info("Application shutting down")
+
+
 app = FastAPI(
     title="URL Shortener & Analytics Platform",
     version="0.1.0",
     description="A Bitly-style URL shortener with click analytics.",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -38,13 +49,3 @@ app.include_router(urls_router)
 # redirect_router must be last: its "/{short_code}" catch-all would otherwise
 # shadow more specific routes registered after it.
 app.include_router(redirect_router)
-
-
-@app.on_event("startup")
-async def on_startup() -> None:
-    logger.info("Application starting up | environment=%s", settings.environment)
-
-
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    logger.info("Application shutting down")

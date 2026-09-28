@@ -46,7 +46,7 @@ A user submits a long URL and receives a short one. Visiting the short URL redir
 | Alembic migrations (no `create_all()` in production) | ✅ |
 | Dockerized Postgres + Redis + backend, with healthchecks | ✅ |
 | Automated tests (pytest) for creation, collisions, expiry/disable | ✅ |
-| Redis cache-aside layer for redirects | 🚧 |
+| Redis cache-aside layer for redirects (hit/miss/TTL, Redis-outage fallback) | ✅ |
 | Click analytics pipeline (background processing) | 🚧 |
 | Geolocation, referrer, and device/browser analytics | 🚧 |
 | Analytics API + SQL aggregation | 🚧 |
@@ -118,28 +118,32 @@ sequenceDiagram
     API-->>C: 201 Created + short_url
 ```
 
-### Redirect (implemented today; Redis cache-aside is the next layer)
+### Redirect (cache-aside, implemented)
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant API as GET /{short_code}
-    participant Redis as Redis (planned)
+    participant Redis as Redis
     participant DB as PostgreSQL
 
     C->>API: GET /{short_code}
-    API->>Redis: GET url:{short_code} (planned)
-    alt cache hit (planned)
-        Redis-->>API: cached payload
-    else cache miss / not yet implemented
+    API->>Redis: GET url:{short_code}
+    alt cache hit
+        Redis-->>API: cached payload (id, original_url, is_active, expires_at)
+        API->>API: validate is_active / expires_at
+    else cache miss
         API->>DB: SELECT * FROM urls WHERE short_code = ?
         DB-->>API: row
-        API->>Redis: SETEX url:{short_code} (planned)
+        API->>API: validate is_active / expires_at
+        API->>Redis: SETEX url:{short_code} (TTL) — only if usable
     end
-    API->>API: validate is_active / expires_at
+    API->>DB: increment total_clicks
     API-->>C: 302 Found, Location: original_url
-    Note over API,DB: click event recorded here (planned, Phase 4)
+    Note over API,DB: full click analytics event recorded here (planned, Phase 4)
 ```
+
+If Redis is unreachable, every `CacheService` call catches `RedisError`, logs a warning, and returns as if it were a cache miss — the endpoint falls straight through to PostgreSQL. Redis is never a second system of record; a total Redis outage degrades the redirect path's latency, not its correctness.
 
 **Why HTTP 302, not 301:** a short link's destination can be edited, disabled, or expire. A 301 (Moved Permanently) invites browsers to cache the redirect indefinitely and skip the server entirely on repeat visits — silently breaking both editability and click counting. 302 keeps every click live.
 
@@ -221,6 +225,19 @@ Custom aliases skip the retry loop entirely — a duplicate alias is a genuine c
 **Trade-off:** every index speeds up its target query but costs extra write time and storage on every `INSERT`. `click_events` is a high-write table (one row per redirect), so indexes on it are deliberately limited to the two access patterns actually needed — no indexing "just in case."
 
 Once traffic-representative data exists, `EXPLAIN ANALYZE` output for the redirect lookup and the analytics range query will be added here rather than guessed at.
+
+## Redis Caching
+
+Cache-aside, implemented in `app/services/cache_service.py` and wired into `GET /{short_code}`.
+
+- **Key:** `url:{short_code}`
+- **Value:** a small JSON payload — `id`, `original_url`, `is_active`, `expires_at` — deliberately not the full row (no `title`, `user_id`, etc.), since those fields are never needed to serve a redirect.
+- **TTL:** `REDIRECT_CACHE_TTL_SECONDS` (default 3600s / 1 hour).
+- **Population:** only on a cache miss, and only for links that pass `is_link_usable()` — an expired or disabled link is never written to the cache, so a bad entry can't outlive its own validity check.
+- **Validation on every hit:** the cached `is_active`/`expires_at` are re-checked on every request, not trusted blindly. This bounds the "stale cache" risk: even though nothing currently invalidates the cache on edit/disable (those endpoints don't exist yet — Phase 6), a link disabled *after* being cached would still be caught up to TTL expiry by whichever check runs first. Once edit/disable endpoints exist, they will call `CacheService.invalidate()` to remove the stale key immediately rather than waiting out the TTL.
+- **Failure mode:** every `CacheService` method catches `redis.RedisError` internally and returns/no-ops rather than raising. A Redis outage means every request pays a full Postgres round-trip (cache-miss cost, permanently) — slower, never broken.
+
+**Why cache-aside over a write-through or read-through cache:** the redirect path reads far more than it writes (one `INSERT` per link creation, many `GET`s per link over its lifetime), and Postgres must remain authoritative regardless of Redis's state — cache-aside is the standard fit for that access pattern and keeps Redis strictly optional.
 
 ## Error Handling
 
@@ -320,9 +337,12 @@ The initial migration (`4909c0ae0e73`) creates `users`, `urls`, and `click_event
 docker compose exec backend pytest app/tests/ -v
 ```
 
-Current coverage (10 tests): URL creation with a generated code, custom-alias creation, reserved-alias rejection, duplicate-alias conflict, collision retry (mocked to force two collisions before success), retry exhaustion, and redirect resolution for missing/expired/disabled links.
+Current coverage (23 tests):
+- **Shortener:** creation with a generated code, custom-alias creation, reserved-alias rejection, duplicate-alias conflict, collision retry (mocked to force two collisions before success), retry exhaustion, resolution for missing/expired/disabled links.
+- **Cache:** set/get round-trip, miss, invalidate, TTL is applied correctly, graceful fallback when Redis raises on GET or SETEX, corrupt cache entries are ignored rather than crashing.
+- **Redirect (integration, via `TestClient`):** cache populated on miss and served on hit, `total_clicks` increments on both paths, 404 for missing codes, 410 for expired/disabled links (and confirms they're never cached), and a full request succeeds even when Redis is unreachable.
 
-Tests run against the same PostgreSQL instance as local dev, each wrapped in an outer transaction + `SAVEPOINT` that's rolled back afterward — no test leaves data behind, and none depend on execution order.
+Tests run against the same PostgreSQL instance as local dev, each wrapped in an outer transaction (`join_transaction_mode="create_savepoint"`) that's rolled back afterward — so application code under test can call `db.commit()` freely (as the redirect endpoint does) without any of it surviving past the test. Redis-backed tests use a real Redis connection, flushed before and after each test.
 
 ## Privacy Considerations
 
@@ -332,13 +352,12 @@ Click analytics are not yet implemented (Phase 4), but the schema already reflec
 
 The remaining phases, in build order:
 
-1. **Redis cache-aside layer** for the redirect path — cache hit/miss/invalidation, TTL strategy, graceful fallback to Postgres if Redis is unavailable.
-2. **Click analytics pipeline** — background-processed click events, referrer normalization, User-Agent parsing (browser/OS/device), IP geolocation, and SQL aggregation endpoints.
-3. **Authentication & authorization** — JWT-based auth, per-user URL ownership, protected analytics.
-4. **Advanced URL features** — QR codes, enable/disable/edit flows exposed via API.
-5. **Redis-backed rate limiting**, scoped differently per endpoint class.
-6. **React dashboard** — landing page, auth flows, link management, analytics visualizations.
-7. **Quality pass** — expanded test coverage, load testing (Locust/k6) comparing cache-hit vs. cache-miss latency, `docs/system-design.md`.
+1. **Click analytics pipeline** — background-processed click events, referrer normalization, User-Agent parsing (browser/OS/device), IP geolocation, and SQL aggregation endpoints.
+2. **Authentication & authorization** — JWT-based auth, per-user URL ownership, protected analytics.
+3. **Advanced URL features** — QR codes, enable/disable/edit flows exposed via API (and wiring `CacheService.invalidate()` into them).
+4. **Redis-backed rate limiting**, scoped differently per endpoint class.
+5. **React dashboard** — landing page, auth flows, link management, analytics visualizations.
+6. **Quality pass** — expanded test coverage, load testing (Locust/k6) comparing cache-hit vs. cache-miss latency, `docs/system-design.md`.
 
 Each phase is verified (migrations run, tests pass, manual smoke test) before moving to the next, and this README is updated alongside the code rather than after the fact.
 
