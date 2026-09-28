@@ -2,7 +2,7 @@ import logging
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from fastapi.responses import RedirectResponse
 from redis import Redis
 from sqlalchemy.orm import Session
@@ -14,6 +14,7 @@ from app.core.exceptions import GoneError
 from app.core.redis_client import get_redis
 from app.repositories.url_repository import URLRepository
 from app.services.cache_service import CacheService
+from app.services.click_recording_service import record_click
 from app.services.shortener_service import ShortenerService
 from app.utils.link_status import is_link_usable
 
@@ -22,14 +23,29 @@ logger = logging.getLogger("app.redirect")
 router = APIRouter(tags=["Redirect"])
 
 
+def _schedule_click_recording(background_tasks: BackgroundTasks, request: Request, url_id: uuid.UUID) -> None:
+    # request.client is None in some ASGI test/proxy setups; guard rather
+    # than let a background task crash on a missing attribute.
+    ip = request.client.host if request.client else None
+    background_tasks.add_task(
+        record_click,
+        url_id=url_id,
+        ip=ip,
+        user_agent=request.headers.get("user-agent"),
+        referrer=request.headers.get("referer"),
+    )
+
+
 @router.get("/{short_code}")
 def redirect_to_original(
     short_code: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
     redis_client: Redis = Depends(get_redis),
 ) -> RedirectResponse:
-    """The hot path, now cache-aside:
+    """The hot path, cache-aside in front of Postgres:
 
         Redis GET -> HIT: validate cached payload -> redirect
                   -> MISS: Postgres SELECT -> validate -> Redis SETEX -> redirect
@@ -37,8 +53,14 @@ def redirect_to_original(
     CacheService never raises on a Redis problem, so a Redis outage silently
     degrades this endpoint to Postgres-only rather than breaking redirects.
     Only *usable* links are cached — resolve_for_redirect raises before we
-    ever reach cache.set(), so expired/disabled links are never cached in
-    the first place.
+    ever reach cache.set(), so expired/disabled links are never cached.
+
+    Click analytics are scheduled as a BackgroundTask: it runs after this
+    response has already been sent, so referrer/UA/geo parsing never adds
+    latency to the redirect itself (see click_recording_service.record_click).
+    total_clicks, by contrast, is incremented synchronously — it's a single
+    indexed-PK update and the one figure a URL's own detail view needs
+    immediately, so it doesn't need to wait on the background pipeline.
 
     HTTP 302 (Found), not 301: see README "Request Lifecycle" for why a
     short link must never be permanently cached by the browser.
@@ -52,8 +74,10 @@ def redirect_to_original(
         if not is_link_usable(cached["is_active"], expires_at):
             raise GoneError("This link has expired or been disabled.")
 
-        repo.increment_clicks(uuid.UUID(cached["id"]))
+        url_id = uuid.UUID(cached["id"])
+        repo.increment_clicks(url_id)
         db.commit()
+        _schedule_click_recording(background_tasks, request, url_id)
         return RedirectResponse(url=cached["original_url"], status_code=status.HTTP_302_FOUND)
 
     service = ShortenerService(db, settings)
@@ -62,5 +86,6 @@ def redirect_to_original(
     cache.set(url)
     repo.increment_clicks(url.id)
     db.commit()
+    _schedule_click_recording(background_tasks, request, url.id)
 
     return RedirectResponse(url=url.original_url, status_code=status.HTTP_302_FOUND)

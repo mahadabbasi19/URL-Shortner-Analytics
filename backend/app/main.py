@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.v1.analytics import router as analytics_router
 from app.api.v1.health import router as health_router
 from app.api.v1.redirect import router as redirect_router
 from app.api.v1.urls import router as urls_router
@@ -46,6 +47,7 @@ app.add_exception_handler(Exception, unhandled_error_handler)
 
 app.include_router(health_router)
 app.include_router(urls_router)
+app.include_router(analytics_router)
 # redirect_router must be last: its "/{short_code}" catch-all would otherwise
 # shadow more specific routes registered after it.
 app.include_router(redirect_router)

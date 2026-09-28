@@ -14,6 +14,11 @@ This project is being built incrementally and documented as it goes. The section
 - [Database Schema](#database-schema)
 - [Short-Code Generation & Collision Handling](#short-code-generation--collision-handling)
 - [PostgreSQL Indexing](#postgresql-indexing)
+- [Redis Caching](#redis-caching)
+- [Analytics Pipeline](#analytics-pipeline)
+- [Geolocation](#geolocation)
+- [Referrer & Device Analytics](#referrer--device-analytics)
+- [SQL Analytics](#sql-analytics)
 - [Error Handling](#error-handling)
 - [API Endpoints](#api-endpoints)
 - [Project Structure](#project-structure)
@@ -47,9 +52,10 @@ A user submits a long URL and receives a short one. Visiting the short URL redir
 | Dockerized Postgres + Redis + backend, with healthchecks | ✅ |
 | Automated tests (pytest) for creation, collisions, expiry/disable | ✅ |
 | Redis cache-aside layer for redirects (hit/miss/TTL, Redis-outage fallback) | ✅ |
-| Click analytics pipeline (background processing) | 🚧 |
-| Geolocation, referrer, and device/browser analytics | 🚧 |
-| Analytics API + SQL aggregation | 🚧 |
+| Click analytics pipeline (background processing via FastAPI BackgroundTasks) | ✅ |
+| Referrer normalization and User-Agent (browser/OS/device) parsing | ✅ |
+| IP geolocation (MaxMind GeoLite2, graceful no-op if unconfigured) | ✅ |
+| Analytics API + SQL aggregation (`GET /api/v1/urls/{id}/analytics`) | ✅ |
 | JWT authentication & per-user URL ownership | 🚧 |
 | Redis-backed rate limiting | 🚧 |
 | QR code generation | 🚧 |
@@ -138,9 +144,11 @@ sequenceDiagram
         API->>API: validate is_active / expires_at
         API->>Redis: SETEX url:{short_code} (TTL) — only if usable
     end
-    API->>DB: increment total_clicks
+    API->>DB: increment total_clicks (synchronous)
     API-->>C: 302 Found, Location: original_url
-    Note over API,DB: full click analytics event recorded here (planned, Phase 4)
+    API-)BG: BackgroundTask: record_click (runs after response is sent)
+    BG->>BG: parse UA, normalize referrer, hash visitor, GeoIP lookup
+    BG->>DB: INSERT click_events row
 ```
 
 If Redis is unreachable, every `CacheService` call catches `RedisError`, logs a warning, and returns as if it were a cache miss — the endpoint falls straight through to PostgreSQL. Redis is never a second system of record; a total Redis outage degrades the redirect path's latency, not its correctness.
@@ -239,6 +247,53 @@ Cache-aside, implemented in `app/services/cache_service.py` and wired into `GET 
 
 **Why cache-aside over a write-through or read-through cache:** the redirect path reads far more than it writes (one `INSERT` per link creation, many `GET`s per link over its lifetime), and Postgres must remain authoritative regardless of Redis's state — cache-aside is the standard fit for that access pattern and keeps Redis strictly optional.
 
+## Analytics Pipeline
+
+Every redirect schedules a `record_click` **FastAPI `BackgroundTask`** (`app/services/click_recording_service.py`), which runs only *after* the redirect response has already been sent to the client:
+
+```mermaid
+flowchart LR
+    R["Redirect endpoint"] -->|schedules| BT["BackgroundTask\nrecord_click(url_id, ip, ua, referrer)"]
+    R -->|response already sent| Client
+    BT --> UA["parse_user_agent()"]
+    BT --> Ref["normalize_referrer()"]
+    BT --> Geo["GeoService.lookup()"]
+    BT --> Hash["hash_visitor()"]
+    UA & Ref & Geo & Hash --> Insert["INSERT click_events"]
+```
+
+- **Why BackgroundTasks and not Celery/Kafka:** the redirect response must not wait on UA parsing, GeoIP lookups, or a second database write — but at this project's scale, a full message broker would be unjustified complexity. `BackgroundTasks` gets the same "don't block the response" property for free, in-process.
+- **Scale-out path:** if click volume outgrew a single process's background-task capacity, the natural evolution is `Redirect Service → Event Queue (Kafka/SQS/Redis Streams) → Analytics Workers → Analytics Database` — decoupling ingestion from processing and allowing horizontal worker scaling. Not implemented here; documented because the interview question always comes up.
+- **`total_clicks` stays synchronous:** it's a single indexed-PK update, cheap enough to not need deferring, and it's the one number a URL's detail view needs immediately (e.g., right after creating a link and sharing it).
+- **Failure handling:** `record_click` opens its own DB session (the request-scoped one is already closed by the time it runs) and wraps everything in a broad `try/except` — any failure (bad GeoIP data, a transient DB error) is logged via `logger.exception` and swallowed. An analytics failure must never crash the process or surface to the visitor who was just redirected.
+
+## Geolocation
+
+`GeoService` (`app/services/geo_service.py`) wraps a local [MaxMind GeoLite2](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data) City database (free, requires a MaxMind account to download — not bundled in this repo).
+
+- If `GEOIP_DATABASE_PATH` doesn't point to an existing file, `GeoService` logs it once at startup and every `lookup()` call returns `(None, None, None)` — geolocation degrades to "unavailable," never to a crash. This is the current state of this repo (no database file is committed).
+- To enable it locally: download `GeoLite2-City.mmdb` from MaxMind and place it at the path in `.env`'s `GEOIP_DATABASE_PATH`, then restart the backend.
+- **Accuracy is inherently approximate.** VPNs, corporate proxies, mobile carrier NAT, and ISP routing all mean the resolved IP frequently isn't near the visitor's actual location — this is a limitation of IP geolocation in general, not of this implementation.
+
+## Referrer & Device Analytics
+
+- **Referrer normalization** (`app/utils/referrer.py`): the raw `Referer` header is parsed for its hostname, `www.` is stripped, and a small map folds known-provider subdomains (`l.facebook.com`, `m.facebook.com`, `google.co.uk`, `t.co`, …) onto one canonical name (`facebook.com`, `google.com`, `x.com`) so "top referrers" isn't fragmented across near-duplicate rows. No `Referer` header at all normalizes to `"Direct/Unknown"`.
+- **User-Agent parsing** (`app/utils/user_agent.py`): uses the maintained `user-agents` library rather than a hand-rolled regex parser (UA strings are a notoriously messy, ever-shifting format). Extracts `browser`, `operating_system`, and buckets `device_type` into `Desktop` / `Mobile` / `Tablet` / `Bot` / `Other`.
+
+## SQL Analytics
+
+All aggregation happens in PostgreSQL (`app/repositories/click_event_repository.py`), never by pulling every `click_events` row into Python:
+
+| Metric | Query shape |
+|---|---|
+| Total clicks | `COUNT(*) WHERE url_id = ?` |
+| Unique visitors (approximate) | `COUNT(DISTINCT visitor_hash) WHERE url_id = ? AND visitor_hash IS NOT NULL` |
+| Clicks today | `COUNT(*) WHERE url_id = ? AND clicked_at >= <today, UTC>` |
+| Clicks over time | `SELECT date_trunc('day', clicked_at), COUNT(*) ... GROUP BY 1 ORDER BY 1` |
+| Top countries / cities / referrers / browsers / OS / devices | `SELECT <column>, COUNT(*) ... GROUP BY <column> ORDER BY COUNT(*) DESC LIMIT 5`, column `IS NOT NULL` |
+
+All of the above accept an optional `[start, end]` UTC range, applied as `clicked_at >= start` / `clicked_at <= end` — which is exactly what `ix_click_events_url_id_clicked_at` (see [PostgreSQL Indexing](#postgresql-indexing)) is built to serve efficiently: an index range scan on the leading `url_id` equality plus the `clicked_at` range, with no separate sort needed for the time-series query.
+
 ## Error Handling
 
 All application errors return a consistent envelope instead of a stack trace:
@@ -261,7 +316,8 @@ All application errors return a consistent envelope instead of a stack trace:
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/v1/urls` | Create a short URL (generated code or custom alias). |
-| `GET` | `/{short_code}` | Resolve and redirect (302) to the original URL. |
+| `GET` | `/{short_code}` | Resolve and redirect (302) to the original URL; schedules background click recording. |
+| `GET` | `/api/v1/urls/{id}/analytics` | Aggregated click analytics for a URL. Optional `start_date`/`end_date` (UTC, inclusive). Not yet ownership-restricted — see Roadmap. |
 | `GET` | `/health` | Liveness/readiness — reports PostgreSQL and Redis status independently. |
 | `GET` | `/docs` | Interactive Swagger/OpenAPI documentation. |
 
@@ -337,27 +393,33 @@ The initial migration (`4909c0ae0e73`) creates `users`, `urls`, and `click_event
 docker compose exec backend pytest app/tests/ -v
 ```
 
-Current coverage (23 tests):
+Current coverage (44 tests):
 - **Shortener:** creation with a generated code, custom-alias creation, reserved-alias rejection, duplicate-alias conflict, collision retry (mocked to force two collisions before success), retry exhaustion, resolution for missing/expired/disabled links.
 - **Cache:** set/get round-trip, miss, invalidate, TTL is applied correctly, graceful fallback when Redis raises on GET or SETEX, corrupt cache entries are ignored rather than crashing.
 - **Redirect (integration, via `TestClient`):** cache populated on miss and served on hit, `total_clicks` increments on both paths, 404 for missing codes, 410 for expired/disabled links (and confirms they're never cached), and a full request succeeds even when Redis is unreachable.
+- **Referrer / User-Agent / visitor-hash utilities:** domain normalization and canonical-provider mapping, browser/OS/device-type extraction for desktop/mobile/bot UAs, hash determinism and day-rotation.
+- **Click recording:** `record_click` writes a correctly-populated `click_events` row, and a failure (e.g. a foreign-key violation) is logged and swallowed rather than raised.
+- **Analytics:** SQL aggregation correctness (total/unique/top-N/date-filtering) at the service layer, `404` for a nonexistent URL, and a full redirect → background-task → analytics-query round trip confirming the whole pipeline end to end.
 
 Tests run against the same PostgreSQL instance as local dev, each wrapped in an outer transaction (`join_transaction_mode="create_savepoint"`) that's rolled back afterward — so application code under test can call `db.commit()` freely (as the redirect endpoint does) without any of it surviving past the test. Redis-backed tests use a real Redis connection, flushed before and after each test.
 
 ## Privacy Considerations
 
-Click analytics are not yet implemented (Phase 4), but the schema already reflects the intended privacy posture: `click_events.visitor_hash` is documented to hold a SHA-256 hash of (IP + User-Agent + daily salt), never a raw IP address. Raw IPs will not be persisted; geolocation will be derived from the IP at request time and only the resulting country/region/city is stored. This section will be expanded with the actual implementation in Phase 4.
+- **Raw IP addresses are never persisted.** The IP seen by the redirect handler is used only in-memory, for two purposes: a GeoIP lookup (to resolve country/region/city) and computing `visitor_hash`. The IP itself never reaches the `click_events` table.
+- **`visitor_hash`** is `SHA-256(ip + "|" + user_agent + "|" + today's date)` (`app/utils/visitor_hash.py`). It exists solely to approximate unique-visitor counts via `COUNT(DISTINCT visitor_hash)`. Rotating the salt by calendar day means the same visitor gets a *different* hash tomorrow — it's not designed to be a durable cross-session identifier, and it can't be reversed back to an IP.
+- **Geolocation resolves to city-level, at most** — never a precise coordinate — and is approximate by nature (see [Geolocation](#geolocation)).
+- **`user_agent`** (the full raw string) is stored as-is for debugging/parsing-improvement purposes; it's not linked to any account identity in the schema, since `click_events` has no `user_id`.
+- **No third-party analytics/tracking scripts** are involved — all analytics are first-party, computed from the server's own request handling.
 
 ## Roadmap
 
 The remaining phases, in build order:
 
-1. **Click analytics pipeline** — background-processed click events, referrer normalization, User-Agent parsing (browser/OS/device), IP geolocation, and SQL aggregation endpoints.
-2. **Authentication & authorization** — JWT-based auth, per-user URL ownership, protected analytics.
-3. **Advanced URL features** — QR codes, enable/disable/edit flows exposed via API (and wiring `CacheService.invalidate()` into them).
-4. **Redis-backed rate limiting**, scoped differently per endpoint class.
-5. **React dashboard** — landing page, auth flows, link management, analytics visualizations.
-6. **Quality pass** — expanded test coverage, load testing (Locust/k6) comparing cache-hit vs. cache-miss latency, `docs/system-design.md`.
+1. **Authentication & authorization** — JWT-based auth, per-user URL ownership, and locking `GET /api/v1/urls/{id}/analytics` down to the owning user (currently open to any URL id).
+2. **Advanced URL features** — QR codes, enable/disable/edit flows exposed via API (and wiring `CacheService.invalidate()` into them).
+3. **Redis-backed rate limiting**, scoped differently per endpoint class.
+4. **React dashboard** — landing page, auth flows, link management, analytics visualizations.
+5. **Quality pass** — expanded test coverage, load testing (Locust/k6) comparing cache-hit vs. cache-miss latency, `docs/system-design.md`.
 
 Each phase is verified (migrations run, tests pass, manual smoke test) before moving to the next, and this README is updated alongside the code rather than after the fact.
 
