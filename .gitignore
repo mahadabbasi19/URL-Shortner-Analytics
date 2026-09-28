@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.env
+.env.local
+node_modules/
+dist/
+build/
+.DS_Store
+*.log
+frontend/.vite/
+backend/.coverage
+htmlcov/
+.colima-data/
