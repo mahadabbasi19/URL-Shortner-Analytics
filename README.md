@@ -1,0 +1,349 @@
+# URL Shortener & Analytics Platform
+
+A production-style URL shortener and click-analytics platform, built the way a small SaaS product (think Bitly) would actually be engineered — not a CRUD tutorial. FastAPI + PostgreSQL + Redis on the backend, with a collision-resistant short-code generator, a cache-aside redirect path, and a React analytics dashboard.
+
+This project is being built incrementally and documented as it goes. The sections below are marked **✅ Implemented** or **🚧 Planned** so this README never claims more than the code actually does.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Technology Stack](#technology-stack)
+- [Architecture](#architecture)
+- [Request Lifecycle](#request-lifecycle)
+- [Database Schema](#database-schema)
+- [Short-Code Generation & Collision Handling](#short-code-generation--collision-handling)
+- [PostgreSQL Indexing](#postgresql-indexing)
+- [Error Handling](#error-handling)
+- [API Endpoints](#api-endpoints)
+- [Project Structure](#project-structure)
+- [Local Setup](#local-setup)
+- [Docker Setup](#docker-setup)
+- [Database Migrations](#database-migrations)
+- [Testing](#testing)
+- [Privacy Considerations](#privacy-considerations)
+- [Roadmap](#roadmap)
+- [Trade-offs](#trade-offs)
+
+## Overview
+
+A user submits a long URL and receives a short one. Visiting the short URL redirects to the original destination and records a click event for later analytics. The redirect path is the hottest, most latency-sensitive part of the system and is designed accordingly: a cache-aside Redis layer in front of PostgreSQL (planned — see [Roadmap](#roadmap)), with click analytics processed out of the request's critical path.
+
+## Features
+
+| Feature | Status |
+|---|---|
+| Short URL creation (`POST /api/v1/urls`) | ✅ |
+| Base62 short codes, CSPRNG-generated | ✅ |
+| Collision-resistant generation (retry on DB unique-constraint conflict) | ✅ |
+| Custom aliases with reserved-word protection | ✅ |
+| Link expiration (`expires_at`) | ✅ |
+| Enable/disable links (`is_active`) | ✅ |
+| Redirect engine (`GET /{short_code}`, HTTP 302) | ✅ |
+| Consistent JSON error envelope | ✅ |
+| Structured logging | ✅ |
+| Health endpoint (`GET /health`, checks Postgres + Redis independently) | ✅ |
+| Alembic migrations (no `create_all()` in production) | ✅ |
+| Dockerized Postgres + Redis + backend, with healthchecks | ✅ |
+| Automated tests (pytest) for creation, collisions, expiry/disable | ✅ |
+| Redis cache-aside layer for redirects | 🚧 |
+| Click analytics pipeline (background processing) | 🚧 |
+| Geolocation, referrer, and device/browser analytics | 🚧 |
+| Analytics API + SQL aggregation | 🚧 |
+| JWT authentication & per-user URL ownership | 🚧 |
+| Redis-backed rate limiting | 🚧 |
+| QR code generation | 🚧 |
+| React analytics dashboard | 🚧 |
+| Load testing (Locust/k6) | 🚧 |
+
+## Technology Stack
+
+**Backend:** Python 3.12, FastAPI, SQLAlchemy 2.x, Pydantic v2, Alembic, PostgreSQL 16, Redis 7, pytest.
+
+**Frontend (planned):** React, TypeScript, Vite, Tailwind CSS, React Router, TanStack Query, Recharts.
+
+**Infrastructure:** Docker, Docker Compose, environment-variable configuration.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Client
+        Browser
+    end
+
+    subgraph Backend["FastAPI Backend"]
+        API["API Layer\n(routers)"]
+        SVC["Service Layer\n(business logic)"]
+        REPO["Repository Layer\n(SQL access)"]
+    end
+
+    Redis[(Redis\ncache-aside · planned)]
+    PG[(PostgreSQL\nsystem of record)]
+
+    Browser -->|HTTP| API
+    API --> SVC
+    SVC --> REPO
+    REPO --> PG
+    SVC -.->|planned| Redis
+```
+
+The backend follows a layered architecture: **routers** (`api/`) handle HTTP concerns only, **services** (`services/`) hold business logic (short-code generation, validation rules), and **repositories** (`repositories/`) isolate SQLAlchemy query-building so services stay testable without a real database query in every unit test.
+
+## Request Lifecycle
+
+### Create a short URL (implemented)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as POST /api/v1/urls
+    participant SVC as ShortenerService
+    participant DB as PostgreSQL
+
+    C->>API: original_url, custom_alias?, expires_at?
+    API->>SVC: create_url(payload)
+    alt custom_alias provided
+        SVC->>SVC: reject if reserved word
+        SVC->>DB: INSERT (short_code = alias)
+        DB-->>SVC: unique violation? -> 409 Conflict
+    else generated code
+        loop up to max_retries
+            SVC->>SVC: generate Base62 code (CSPRNG)
+            SVC->>DB: INSERT inside SAVEPOINT
+            DB-->>SVC: unique violation? retry : success
+        end
+    end
+    SVC-->>API: URL row
+    API-->>C: 201 Created + short_url
+```
+
+### Redirect (implemented today; Redis cache-aside is the next layer)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as GET /{short_code}
+    participant Redis as Redis (planned)
+    participant DB as PostgreSQL
+
+    C->>API: GET /{short_code}
+    API->>Redis: GET url:{short_code} (planned)
+    alt cache hit (planned)
+        Redis-->>API: cached payload
+    else cache miss / not yet implemented
+        API->>DB: SELECT * FROM urls WHERE short_code = ?
+        DB-->>API: row
+        API->>Redis: SETEX url:{short_code} (planned)
+    end
+    API->>API: validate is_active / expires_at
+    API-->>C: 302 Found, Location: original_url
+    Note over API,DB: click event recorded here (planned, Phase 4)
+```
+
+**Why HTTP 302, not 301:** a short link's destination can be edited, disabled, or expire. A 301 (Moved Permanently) invites browsers to cache the redirect indefinitely and skip the server entirely on repeat visits — silently breaking both editability and click counting. 302 keeps every click live.
+
+## Database Schema
+
+```mermaid
+erDiagram
+    USERS ||--o{ URLS : owns
+    URLS ||--o{ CLICK_EVENTS : generates
+
+    USERS {
+        uuid id PK
+        string email UK
+        string password_hash
+        datetime created_at
+        datetime updated_at
+    }
+
+    URLS {
+        uuid id PK
+        uuid user_id FK "nullable — anonymous links allowed"
+        text original_url
+        string short_code UK
+        string custom_alias UK "nullable"
+        string title "nullable"
+        datetime created_at
+        datetime updated_at
+        datetime expires_at "nullable"
+        boolean is_active
+        int total_clicks "denormalized counter"
+    }
+
+    CLICK_EVENTS {
+        uuid id PK
+        uuid url_id FK
+        datetime clicked_at
+        string visitor_hash "nullable — SHA-256, never raw IP"
+        string country "nullable"
+        string region "nullable"
+        string city "nullable"
+        string referrer "nullable"
+        string referrer_domain "nullable"
+        string user_agent "nullable"
+        string browser "nullable"
+        string operating_system "nullable"
+        string device_type "nullable"
+    }
+```
+
+`users.id` is currently nullable-foreign-keyed from `urls` — anonymous link creation is allowed today since authentication isn't implemented yet (Phase 5). Once auth lands, the API layer will attach `user_id` for logged-in requests without a schema change.
+
+`urls.total_clicks` is a denormalized counter, updated alongside each redirect. It exists so a "list my URLs" view never has to run `COUNT(*)` over `click_events` for every row — the detailed, filterable analytics still come from `click_events` itself.
+
+## Short-Code Generation & Collision Handling
+
+Codes are 7-character Base62 strings (`0-9`, `a-z`, `A-Z`), generated with Python's `secrets` module — a CSPRNG, not `random`, so codes aren't predictable or enumerable by an attacker who has observed other codes.
+
+**Namespace:** 62⁷ ≈ 3.5 trillion combinations. Collisions are rare at that scale but not impossible, so the database — not an application-level existence check — is the source of truth for uniqueness:
+
+1. Generate a candidate code.
+2. Attempt `INSERT` inside a `SAVEPOINT`.
+3. If PostgreSQL raises a unique-constraint violation, roll back **only that savepoint** and retry with a new code (`SHORT_CODE_MAX_RETRIES`, default 5).
+4. If retries are exhausted, fail loudly and log it — this is treated as an abnormal event, not silently swallowed.
+
+Using a `SAVEPOINT` per attempt (rather than a full `session.rollback()`) matters: a bare rollback on collision would discard *any other pending work* on that database session, not just the failed insert. This was caught by a test (`test_collision_triggers_retry_and_eventually_succeeds`) during development and fixed before merging.
+
+Custom aliases skip the retry loop entirely — a duplicate alias is a genuine conflict (`409`), not something to silently paper over with a different code, since the user chose that alias deliberately.
+
+## PostgreSQL Indexing
+
+| Index | Query it serves | Column order rationale |
+|---|---|---|
+| `urls.short_code` (unique) | Redirect lookup: `WHERE short_code = ?` | Single column, enforces uniqueness and gives O(log n) lookup on the hottest read path in the system. |
+| `urls.custom_alias` (unique) | Alias-uniqueness check on create | Enforced at the DB level so concurrent alias claims can't both succeed. |
+| `ix_urls_user_id_created_at (user_id, created_at)` | "My links, newest first" — the dashboard's main list query | `user_id` leads because it's always an equality filter; `created_at` second lets Postgres satisfy `ORDER BY created_at DESC` from the index without a separate sort. |
+| `ix_click_events_url_id_clicked_at (url_id, clicked_at)` | "Clicks for URL X between date A and B" — every analytics query | Same reasoning: `url_id` is always the equality filter, `clicked_at` supports the date-range scan and ordering. |
+| `click_events.referrer_domain` | Top-referrers aggregation (Phase 4) | Supports `GROUP BY referrer_domain` without a full table scan. |
+
+**Trade-off:** every index speeds up its target query but costs extra write time and storage on every `INSERT`. `click_events` is a high-write table (one row per redirect), so indexes on it are deliberately limited to the two access patterns actually needed — no indexing "just in case."
+
+Once traffic-representative data exists, `EXPLAIN ANALYZE` output for the redirect lookup and the analytics range query will be added here rather than guessed at.
+
+## Error Handling
+
+All application errors return a consistent envelope instead of a stack trace:
+
+```json
+{ "error": { "code": "not_found", "message": "Short link not found." } }
+```
+
+| Scenario | HTTP status | `error.code` |
+|---|---|---|
+| Short code doesn't exist | 404 | `not_found` |
+| Link expired or disabled | 410 | `gone` |
+| Custom alias already taken | 409 | `conflict` |
+| Custom alias is a reserved word | 422 | `validation_error` |
+| Invalid `original_url` (bad scheme, malformed) | 422 | `validation_error` |
+| Unhandled server error | 500 | `internal_error` (no internals leaked) |
+
+## API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/urls` | Create a short URL (generated code or custom alias). |
+| `GET` | `/{short_code}` | Resolve and redirect (302) to the original URL. |
+| `GET` | `/health` | Liveness/readiness — reports PostgreSQL and Redis status independently. |
+| `GET` | `/docs` | Interactive Swagger/OpenAPI documentation. |
+
+Full interactive docs are available at `http://localhost:8000/docs` once the backend is running.
+
+## Project Structure
+
+```
+url-shortener/
+├── backend/
+│   ├── app/
+│   │   ├── main.py              # FastAPI app, middleware, router/exception wiring
+│   │   ├── api/v1/               # Routers — HTTP layer only
+│   │   ├── core/                 # Config, DB session, Redis client, logging, exceptions
+│   │   ├── models/                # SQLAlchemy ORM models
+│   │   ├── schemas/               # Pydantic request/response models
+│   │   ├── services/              # Business logic (short-code generation, validation)
+│   │   ├── repositories/          # SQL query access, isolated from business logic
+│   │   ├── middleware/            # (planned: rate limiting)
+│   │   ├── utils/                 # Base62 generation, reserved-alias list
+│   │   └── tests/                 # pytest suite
+│   ├── alembic/                   # Migration environment + versions
+│   ├── requirements.txt
+│   └── Dockerfile
+├── frontend/                      # (planned — Phase 7)
+├── docker-compose.yml
+├── .env.example
+└── README.md
+```
+
+## Local Setup
+
+Requires Docker (or a Docker-compatible runtime such as [Colima](https://github.com/abiosoft/colima) on macOS) and Docker Compose.
+
+```bash
+git clone https://github.com/mahadabbasi19/URL-Shortner-Analytics.git
+cd URL-Shortner-Analytics
+cp .env.example .env
+
+# Start Postgres + Redis + backend
+docker compose up -d postgres redis backend
+
+# Migrations run automatically on backend startup (see docker-compose.yml).
+# Verify:
+curl http://localhost:8000/health
+```
+
+## Docker Setup
+
+`docker-compose.yml` defines four services (`frontend` is a placeholder until Phase 7):
+
+- **postgres** — Postgres 16, persisted via a named volume, with a `pg_isready` healthcheck.
+- **redis** — Redis 7, with a `redis-cli ping` healthcheck.
+- **backend** — builds from `backend/Dockerfile`, waits for both dependencies to report healthy, runs `alembic upgrade head`, then starts `uvicorn --reload`.
+- **frontend** — reserved for the Phase 7 React app.
+
+No secrets are baked into the image or compose file — everything comes from `.env` (copy `.env.example` and edit for local dev; never commit a real `.env`).
+
+## Database Migrations
+
+Schema changes are managed exclusively through Alembic — the app never calls `Base.metadata.create_all()` in production. To create a new migration after changing a model:
+
+```bash
+docker compose exec backend alembic revision --autogenerate -m "describe the change"
+docker compose exec backend alembic upgrade head
+```
+
+The initial migration (`4909c0ae0e73`) creates `users`, `urls`, and `click_events` with all indexes and constraints described above, and has been verified to apply cleanly to an empty database.
+
+## Testing
+
+```bash
+docker compose exec backend pytest app/tests/ -v
+```
+
+Current coverage (10 tests): URL creation with a generated code, custom-alias creation, reserved-alias rejection, duplicate-alias conflict, collision retry (mocked to force two collisions before success), retry exhaustion, and redirect resolution for missing/expired/disabled links.
+
+Tests run against the same PostgreSQL instance as local dev, each wrapped in an outer transaction + `SAVEPOINT` that's rolled back afterward — no test leaves data behind, and none depend on execution order.
+
+## Privacy Considerations
+
+Click analytics are not yet implemented (Phase 4), but the schema already reflects the intended privacy posture: `click_events.visitor_hash` is documented to hold a SHA-256 hash of (IP + User-Agent + daily salt), never a raw IP address. Raw IPs will not be persisted; geolocation will be derived from the IP at request time and only the resulting country/region/city is stored. This section will be expanded with the actual implementation in Phase 4.
+
+## Roadmap
+
+The remaining phases, in build order:
+
+1. **Redis cache-aside layer** for the redirect path — cache hit/miss/invalidation, TTL strategy, graceful fallback to Postgres if Redis is unavailable.
+2. **Click analytics pipeline** — background-processed click events, referrer normalization, User-Agent parsing (browser/OS/device), IP geolocation, and SQL aggregation endpoints.
+3. **Authentication & authorization** — JWT-based auth, per-user URL ownership, protected analytics.
+4. **Advanced URL features** — QR codes, enable/disable/edit flows exposed via API.
+5. **Redis-backed rate limiting**, scoped differently per endpoint class.
+6. **React dashboard** — landing page, auth flows, link management, analytics visualizations.
+7. **Quality pass** — expanded test coverage, load testing (Locust/k6) comparing cache-hit vs. cache-miss latency, `docs/system-design.md`.
+
+Each phase is verified (migrations run, tests pass, manual smoke test) before moving to the next, and this README is updated alongside the code rather than after the fact.
+
+## Trade-offs
+
+- **FastAPI `BackgroundTasks` over Kafka/Celery for analytics** (planned): the redirect response should not wait on analytics enrichment, but a full message queue is unjustified complexity at this stage. The upgrade path (`Redirect Service → Event Queue → Analytics Workers`) is documented for when volume actually demands it.
+- **Denormalized `total_clicks` on `urls`** alongside the authoritative `click_events` table: a small consistency/write-cost trade for avoiding a `COUNT(*)` on every dashboard list render.
+- **Anonymous URL creation is allowed** (`urls.user_id` is nullable): matches how Bitly-style tools actually work — auth is additive, not a hard requirement to use the core product.

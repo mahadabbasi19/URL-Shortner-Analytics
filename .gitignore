@@ -13,5 +13,6 @@ build/
 *.log
 frontend/.vite/
 backend/.coverage
+backend/.pytest_cache/
 htmlcov/
 .colima-data/
