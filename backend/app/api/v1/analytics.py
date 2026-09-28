@@ -5,7 +5,9 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.exceptions import NotFoundError
+from app.core.deps import get_current_user_optional
+from app.core.exceptions import ForbiddenError, NotFoundError
+from app.models.user import User
 from app.repositories.url_repository import URLRepository
 from app.schemas.analytics import URLAnalyticsResponse
 from app.services.analytics_service import AnalyticsService
@@ -25,15 +27,23 @@ def get_url_analytics(
     start_date: date | None = Query(default=None, description="Inclusive, UTC"),
     end_date: date | None = Query(default=None, description="Inclusive, UTC"),
     db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_current_user_optional),
 ) -> URLAnalyticsResponse:
-    """Aggregated click analytics for one URL. Not yet ownership-restricted
-    — any URL id returns its analytics. Phase 5 (auth) will require the
-    requester to own the URL, matching the README's documented plan.
+    """Aggregated click analytics for one URL.
+
+    Ownership rule: a URL created anonymously (`user_id IS NULL`) has no
+    owner to restrict access to, so its analytics stay publicly readable by
+    short_code-holders — matching how it could be created in the first
+    place. A URL created by an authenticated user is private to that user;
+    anyone else (including an anonymous caller) gets 403.
     """
     repo = URLRepository(db)
     url = repo.get_by_id(url_id)
     if url is None:
         raise NotFoundError("URL not found.")
+
+    if url.user_id is not None and (current_user is None or current_user.id != url.user_id):
+        raise ForbiddenError("You do not have access to this URL's analytics.")
 
     start, end = _to_range_bounds(start_date, end_date)
     return AnalyticsService(db).get_summary(url_id, start, end)

@@ -15,6 +15,7 @@ This project is being built incrementally and documented as it goes. The section
 - [Short-Code Generation & Collision Handling](#short-code-generation--collision-handling)
 - [PostgreSQL Indexing](#postgresql-indexing)
 - [Redis Caching](#redis-caching)
+- [Authentication & Authorization](#authentication--authorization)
 - [Analytics Pipeline](#analytics-pipeline)
 - [Geolocation](#geolocation)
 - [Referrer & Device Analytics](#referrer--device-analytics)
@@ -32,7 +33,7 @@ This project is being built incrementally and documented as it goes. The section
 
 ## Overview
 
-A user submits a long URL and receives a short one. Visiting the short URL redirects to the original destination and records a click event for later analytics. The redirect path is the hottest, most latency-sensitive part of the system and is designed accordingly: a cache-aside Redis layer in front of PostgreSQL (planned — see [Roadmap](#roadmap)), with click analytics processed out of the request's critical path.
+A user submits a long URL and receives a short one. Visiting the short URL redirects to the original destination and records a click event for later analytics. The redirect path is the hottest, most latency-sensitive part of the system and is designed accordingly: a cache-aside Redis layer in front of PostgreSQL, with click analytics processed in the background, out of the request's critical path.
 
 ## Features
 
@@ -56,7 +57,8 @@ A user submits a long URL and receives a short one. Visiting the short URL redir
 | Referrer normalization and User-Agent (browser/OS/device) parsing | ✅ |
 | IP geolocation (MaxMind GeoLite2, graceful no-op if unconfigured) | ✅ |
 | Analytics API + SQL aggregation (`GET /api/v1/urls/{id}/analytics`) | ✅ |
-| JWT authentication & per-user URL ownership | 🚧 |
+| JWT authentication (register/login/me) | ✅ |
+| Per-user URL ownership & authorization (list/view/analytics restricted to owner) | ✅ |
 | Redis-backed rate limiting | 🚧 |
 | QR code generation | 🚧 |
 | React analytics dashboard | 🚧 |
@@ -247,6 +249,19 @@ Cache-aside, implemented in `app/services/cache_service.py` and wired into `GET 
 
 **Why cache-aside over a write-through or read-through cache:** the redirect path reads far more than it writes (one `INSERT` per link creation, many `GET`s per link over its lifetime), and Postgres must remain authoritative regardless of Redis's state — cache-aside is the standard fit for that access pattern and keeps Redis strictly optional.
 
+## Authentication & Authorization
+
+JWT-based, implemented in `app/core/security.py` (hashing/tokens), `app/core/deps.py` (request-level auth dependencies), and `app/services/auth_service.py` (registration/login business logic).
+
+- **Passwords** are hashed with bcrypt (`passlib`), never stored or logged in plaintext.
+- **`POST /api/v1/auth/register`** creates a user; a duplicate email returns `409 Conflict` (via the same SAVEPOINT-per-insert pattern used for short-code collisions — a conflict must only undo its own insert, not other pending work on the session).
+- **`POST /api/v1/auth/login`** verifies the password and returns a JWT (`HS256`, `ACCESS_TOKEN_EXPIRE_MINUTES` default 60). Wrong password and nonexistent email return the *same* `401` message — a distinct error would let an attacker enumerate registered emails.
+- **`GET /api/v1/auth/me`** returns the caller's own profile; requires a valid bearer token.
+- **Two auth dependencies**, used per-endpoint depending on whether anonymous access is meaningful there:
+  - `get_current_user` — **required**. No/invalid/expired token → `401`. Used by `GET /api/v1/urls` (list mine) and `GET /api/v1/urls/{id}`.
+  - `get_current_user_optional` — **optional**. No `Authorization` header at all → `None` (anonymous). A header that *is* present but invalid → still `401`, deliberately: silently downgrading a bad token to "anonymous" would hide a client-side auth bug instead of surfacing it. Used by `POST /api/v1/urls` (anonymous creation stays supported) and the analytics endpoint.
+- **Ownership rule** (`POST /api/v1/urls`, `GET /api/v1/urls/{id}`, `GET /api/v1/urls/{id}/analytics`): a URL created while authenticated is attributed to that user (`urls.user_id`) and only that user can view its detail or analytics — everyone else, including anonymous callers, gets `403`. A URL created **without** auth has no owner (`user_id IS NULL`) and its analytics remain publicly readable by short_code, matching how it could be created in the first place. Verified with live cross-account tests: a second user attempting to read the first user's URL or analytics gets `403`; no token at all on a protected endpoint gets `401`.
+
 ## Analytics Pipeline
 
 Every redirect schedules a `record_click` **FastAPI `BackgroundTask`** (`app/services/click_recording_service.py`), which runs only *after* the redirect response has already been sent to the client:
@@ -309,17 +324,26 @@ All application errors return a consistent envelope instead of a stack trace:
 | Custom alias already taken | 409 | `conflict` |
 | Custom alias is a reserved word | 422 | `validation_error` |
 | Invalid `original_url` (bad scheme, malformed) | 422 | `validation_error` |
+| Email already registered | 409 | `conflict` |
+| Missing/invalid/expired auth token | 401 | `unauthorized` |
+| Wrong password / unknown email at login | 401 | `unauthorized` |
+| Authenticated but not the resource's owner | 403 | `forbidden` |
 | Unhandled server error | 500 | `internal_error` (no internals leaked) |
 
 ## API Endpoints
 
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/v1/urls` | Create a short URL (generated code or custom alias). |
-| `GET` | `/{short_code}` | Resolve and redirect (302) to the original URL; schedules background click recording. |
-| `GET` | `/api/v1/urls/{id}/analytics` | Aggregated click analytics for a URL. Optional `start_date`/`end_date` (UTC, inclusive). Not yet ownership-restricted — see Roadmap. |
-| `GET` | `/health` | Liveness/readiness — reports PostgreSQL and Redis status independently. |
-| `GET` | `/docs` | Interactive Swagger/OpenAPI documentation. |
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/api/v1/auth/register` | — | Create a user account. |
+| `POST` | `/api/v1/auth/login` | — | Exchange email/password for a JWT. |
+| `GET` | `/api/v1/auth/me` | required | Current user's profile. |
+| `POST` | `/api/v1/urls` | optional | Create a short URL. Attributed to the caller if authenticated, anonymous otherwise. |
+| `GET` | `/api/v1/urls` | required | List the authenticated user's URLs. |
+| `GET` | `/api/v1/urls/{id}` | required | View one URL's detail. 403 if you're not the owner. |
+| `GET` | `/{short_code}` | — | Resolve and redirect (302) to the original URL; schedules background click recording. |
+| `GET` | `/api/v1/urls/{id}/analytics` | optional | Aggregated click analytics. Optional `start_date`/`end_date` (UTC, inclusive). Public for anonymously-created URLs; owner-only otherwise. |
+| `GET` | `/health` | — | Liveness/readiness — reports PostgreSQL and Redis status independently. |
+| `GET` | `/docs` | — | Interactive Swagger/OpenAPI documentation. |
 
 Full interactive docs are available at `http://localhost:8000/docs` once the backend is running.
 
@@ -393,13 +417,15 @@ The initial migration (`4909c0ae0e73`) creates `users`, `urls`, and `click_event
 docker compose exec backend pytest app/tests/ -v
 ```
 
-Current coverage (44 tests):
+Current coverage (62 tests):
 - **Shortener:** creation with a generated code, custom-alias creation, reserved-alias rejection, duplicate-alias conflict, collision retry (mocked to force two collisions before success), retry exhaustion, resolution for missing/expired/disabled links.
 - **Cache:** set/get round-trip, miss, invalidate, TTL is applied correctly, graceful fallback when Redis raises on GET or SETEX, corrupt cache entries are ignored rather than crashing.
 - **Redirect (integration, via `TestClient`):** cache populated on miss and served on hit, `total_clicks` increments on both paths, 404 for missing codes, 410 for expired/disabled links (and confirms they're never cached), and a full request succeeds even when Redis is unreachable.
 - **Referrer / User-Agent / visitor-hash utilities:** domain normalization and canonical-provider mapping, browser/OS/device-type extraction for desktop/mobile/bot UAs, hash determinism and day-rotation.
 - **Click recording:** `record_click` writes a correctly-populated `click_events` row, and a failure (e.g. a foreign-key violation) is logged and swallowed rather than raised.
 - **Analytics:** SQL aggregation correctness (total/unique/top-N/date-filtering) at the service layer, `404` for a nonexistent URL, and a full redirect → background-task → analytics-query round trip confirming the whole pipeline end to end.
+- **Auth:** registration (including duplicate-email conflict and password-length validation), login (correct/wrong password, unknown email), `/me` with no/garbage/valid tokens.
+- **Authorization:** anonymous creation still works; authenticated creation attaches ownership and shows up in "my URLs"; a second user gets 403 on another user's URL detail and analytics; anonymous URLs' analytics stay publicly readable; unauthenticated callers get 401 on owner-only endpoints. Also verified live against the running stack with two real accounts.
 
 Tests run against the same PostgreSQL instance as local dev, each wrapped in an outer transaction (`join_transaction_mode="create_savepoint"`) that's rolled back afterward — so application code under test can call `db.commit()` freely (as the redirect endpoint does) without any of it surviving past the test. Redis-backed tests use a real Redis connection, flushed before and after each test.
 
@@ -415,11 +441,10 @@ Tests run against the same PostgreSQL instance as local dev, each wrapped in an 
 
 The remaining phases, in build order:
 
-1. **Authentication & authorization** — JWT-based auth, per-user URL ownership, and locking `GET /api/v1/urls/{id}/analytics` down to the owning user (currently open to any URL id).
-2. **Advanced URL features** — QR codes, enable/disable/edit flows exposed via API (and wiring `CacheService.invalidate()` into them).
-3. **Redis-backed rate limiting**, scoped differently per endpoint class.
-4. **React dashboard** — landing page, auth flows, link management, analytics visualizations.
-5. **Quality pass** — expanded test coverage, load testing (Locust/k6) comparing cache-hit vs. cache-miss latency, `docs/system-design.md`.
+1. **Advanced URL features** — QR codes, enable/disable/edit flows exposed via API (and wiring `CacheService.invalidate()` into them).
+2. **Redis-backed rate limiting**, scoped differently per endpoint class.
+3. **React dashboard** — landing page, auth flows, link management, analytics visualizations.
+4. **Quality pass** — expanded test coverage, load testing (Locust/k6) comparing cache-hit vs. cache-miss latency, `docs/system-design.md`.
 
 Each phase is verified (migrations run, tests pass, manual smoke test) before moving to the next, and this README is updated alongside the code rather than after the fact.
 
