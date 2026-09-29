@@ -1,110 +1,169 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { BarChart3, ExternalLink, Link2, Power, QrCode } from 'lucide-react'
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { API_BASE_URL, api } from '../lib/api'
+import { API_BASE_URL, api, getApiErrorMessage } from '../lib/api'
+import { extractDomain, formatFullNumber, formatRelativeDate } from '../lib/format'
 import type { UrlItem } from '../types'
 import { CopyButton } from './CopyButton'
 import { DeleteButton } from './DeleteButton'
 import { QrModal } from './QrModal'
 import { StatusBadge } from './StatusBadge'
+import { IconButton } from './ui/IconButton'
+import { SkeletonRow } from './ui/Skeleton'
+import { useToast } from './ui/Toast'
 
 function shortUrlFor(url: UrlItem): string {
   return `${API_BASE_URL}/${url.short_code}`
 }
 
+function Favicon({ url }: { url: string }) {
+  const [errored, setErrored] = useState(false)
+  const domain = extractDomain(url)
+
+  if (errored || !domain) {
+    return (
+      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-surface-2 text-text-muted">
+        <Link2 className="h-3.5 w-3.5" />
+      </div>
+    )
+  }
+
+  return (
+    <img
+      src={`https://www.google.com/s2/favicons?domain=${domain}&sz=64`}
+      alt=""
+      width={28}
+      height={28}
+      className="h-7 w-7 shrink-0 rounded-md bg-surface-2 object-contain p-1"
+      onError={() => setErrored(true)}
+    />
+  )
+}
+
 interface LinksTableProps {
   urls: UrlItem[]
   compact?: boolean
+  isLoading?: boolean
 }
 
-export function LinksTable({ urls, compact = false }: LinksTableProps) {
+export function LinksTable({ urls, compact = false, isLoading = false }: LinksTableProps) {
   const queryClient = useQueryClient()
+  const { show } = useToast()
   const [qrTarget, setQrTarget] = useState<UrlItem | null>(null)
 
   const toggleActive = useMutation({
     mutationFn: async (url: UrlItem) => {
       await api.patch(`/api/v1/urls/${url.id}`, { is_active: !url.is_active })
     },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['urls'] }),
+    onSuccess: (_, url) => {
+      queryClient.invalidateQueries({ queryKey: ['urls'] })
+      show(url.is_active ? 'Link disabled.' : 'Link enabled.')
+    },
+    onError: (err) => show(getApiErrorMessage(err), 'error'),
   })
 
   const deleteUrl = useMutation({
     mutationFn: async (id: string) => {
       await api.delete(`/api/v1/urls/${id}`)
     },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['urls'] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['urls'] })
+      show('Link deleted.')
+    },
+    onError: (err) => show(getApiErrorMessage(err), 'error'),
   })
 
-  if (urls.length === 0) {
+  if (isLoading) {
     return (
-      <div className="rounded-2xl border border-dashed border-ink-800 bg-ink-900/30 p-10 text-center">
-        <p className="text-sm text-ink-400">No links yet. Create your first one above.</p>
+      <div className="overflow-hidden rounded-xl border border-border bg-surface">
+        <div className="divide-y divide-border">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <SkeletonRow key={i} />
+          ))}
+        </div>
       </div>
     )
   }
 
+  if (urls.length === 0) {
+    return null
+  }
+
   return (
-    <div className="overflow-hidden rounded-2xl border border-ink-800 bg-ink-900/60">
+    <div className="overflow-hidden rounded-xl border border-border bg-surface">
       <div className="scrollbar-thin overflow-x-auto">
         <table className="w-full text-left text-sm">
           <thead>
-            <tr className="border-b border-ink-800 text-xs uppercase tracking-wide text-ink-500">
-              <th className="px-4 py-3 font-medium">Link</th>
+            <tr className="border-b border-border text-xs font-medium text-text-muted">
+              <th className="px-4 py-3 font-medium sm:px-5">Link</th>
               <th className="px-4 py-3 font-medium">Status</th>
-              <th className="px-4 py-3 font-medium">Clicks</th>
-              {!compact && <th className="px-4 py-3 font-medium">Created</th>}
-              <th className="px-4 py-3 font-medium">Actions</th>
+              <th className="px-4 py-3 text-right font-medium">Clicks</th>
+              {!compact && <th className="hidden px-4 py-3 font-medium sm:table-cell">Created</th>}
+              <th className="px-4 py-3 font-medium sm:px-5">
+                <span className="sr-only">Actions</span>
+              </th>
             </tr>
           </thead>
-          <tbody>
+          <tbody className="divide-y divide-border">
             {urls.map((url) => (
-              <tr key={url.id} className="border-b border-ink-800/60 last:border-0 hover:bg-ink-800/30">
-                <td className="max-w-xs px-4 py-3">
-                  <Link
-                    to={`/links/${url.id}`}
-                    className="block truncate font-mono text-sm font-medium text-brand-300 hover:underline"
-                  >
-                    /{url.short_code}
-                  </Link>
-                  <p className="mt-0.5 truncate text-xs text-ink-500">{url.title || url.original_url}</p>
+              <tr key={url.id} className="group transition-colors hover:bg-surface-2/40">
+                <td className="px-4 py-3 sm:px-5">
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <Favicon url={url.original_url} />
+                    <div className="min-w-0">
+                      <Link
+                        to={`/links/${url.id}`}
+                        className="block truncate font-mono text-[13px] font-medium text-text hover:text-brand-2"
+                      >
+                        {url.short_code}
+                      </Link>
+                      <p className="mt-0.5 truncate text-xs text-text-muted" title={url.original_url}>
+                        {url.title || url.original_url}
+                      </p>
+                    </div>
+                  </div>
                 </td>
                 <td className="px-4 py-3">
                   <StatusBadge url={url} />
                 </td>
-                <td className="px-4 py-3 font-semibold text-white">{url.total_clicks}</td>
+                <td className="px-4 py-3 text-right font-mono text-[13px] font-medium text-text">
+                  {formatFullNumber(url.total_clicks)}
+                </td>
                 {!compact && (
-                  <td className="px-4 py-3 text-ink-500">{new Date(url.created_at).toLocaleDateString()}</td>
+                  <td className="hidden px-4 py-3 text-text-muted sm:table-cell">
+                    {formatRelativeDate(url.created_at)}
+                  </td>
                 )}
-                <td className="px-4 py-3">
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <CopyButton value={shortUrlFor(url)} />
-                    <a
-                      href={shortUrlFor(url)}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="rounded-md border border-ink-700 px-2 py-1 text-xs font-medium text-ink-300 hover:border-ink-600 hover:text-white"
+                <td className="px-4 py-3 sm:px-5">
+                  <div className="flex items-center justify-end gap-0.5 opacity-100 sm:opacity-0 sm:group-hover:opacity-100">
+                    <CopyButton value={shortUrlFor(url)} variant="icon" />
+                    <IconButton label="Open link" size="sm" onClick={() => window.open(shortUrlFor(url), '_blank')}>
+                      <ExternalLink className="h-3.5 w-3.5" />
+                    </IconButton>
+                    <IconButton label="View QR code" size="sm" onClick={() => setQrTarget(url)}>
+                      <QrCode className="h-3.5 w-3.5" />
+                    </IconButton>
+                    <Link
+                      to={`/links/${url.id}`}
+                      aria-label="View analytics"
+                      title="View analytics"
+                      className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-text-secondary transition-colors hover:bg-surface-2 hover:text-text"
                     >
-                      Open
-                    </a>
-                    <button
-                      onClick={() => setQrTarget(url)}
-                      className="rounded-md border border-ink-700 px-2 py-1 text-xs font-medium text-ink-300 hover:border-ink-600 hover:text-white"
-                    >
-                      QR
-                    </button>
+                      <BarChart3 className="h-3.5 w-3.5" />
+                    </Link>
                     {!compact && (
                       <>
-                        <button
+                        <IconButton
+                          label={url.is_active ? 'Disable link' : 'Enable link'}
+                          size="sm"
                           onClick={() => toggleActive.mutate(url)}
                           disabled={toggleActive.isPending}
-                          className="rounded-md border border-ink-700 px-2 py-1 text-xs font-medium text-ink-300 hover:border-ink-600 hover:text-white disabled:opacity-60"
+                          className={url.is_active ? '' : 'text-success'}
                         >
-                          {url.is_active ? 'Disable' : 'Enable'}
-                        </button>
-                        <DeleteButton
-                          isDeleting={deleteUrl.isPending}
-                          onConfirm={() => deleteUrl.mutate(url.id)}
-                        />
+                          <Power className="h-3.5 w-3.5" />
+                        </IconButton>
+                        <DeleteButton isDeleting={deleteUrl.isPending} onConfirm={() => deleteUrl.mutate(url.id)} />
                       </>
                     )}
                   </div>

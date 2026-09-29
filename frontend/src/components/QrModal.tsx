@@ -1,6 +1,8 @@
 import { useQuery } from '@tanstack/react-query'
+import { Download, Loader2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { api } from '../lib/api'
+import { Dialog } from './ui/Dialog'
 
 interface QrModalProps {
   urlId: string
@@ -30,38 +32,25 @@ export function QrModal({ urlId, shortUrl, onClose }: QrModalProps) {
   }, [data])
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
-      <div
-        className="w-full max-w-xs rounded-2xl border border-ink-800 bg-ink-900 p-6 text-center"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h3 className="text-sm font-semibold text-white">QR code</h3>
-        <p className="mt-1 truncate font-mono text-xs text-ink-500">{shortUrl}</p>
-
-        <div className="mx-auto mt-4 flex h-48 w-48 items-center justify-center rounded-xl bg-white p-3">
-          {isLoading && <div className="h-6 w-6 animate-spin rounded-full border-2 border-ink-300 border-t-brand-500" />}
-          {isError && <p className="text-xs text-red-500">Failed to load QR code.</p>}
+    <Dialog open onClose={onClose} title="QR code" description={shortUrl} maxWidth="max-w-xs">
+      <div className="flex flex-col items-center">
+        <div className="flex h-52 w-52 items-center justify-center rounded-xl bg-white p-4">
+          {isLoading && <Loader2 className="h-5 w-5 animate-spin text-text-muted" />}
+          {isError && <p className="text-xs text-danger">Failed to load QR code.</p>}
           {objectUrl && <img src={objectUrl} alt={`QR code for ${shortUrl}`} className="h-full w-full" />}
         </div>
 
-        <div className="mt-4 flex justify-center gap-2">
-          {objectUrl && (
-            <a
-              href={objectUrl}
-              download="qr-code.png"
-              className="rounded-lg border border-ink-700 px-3 py-1.5 text-xs font-medium text-ink-200 hover:border-ink-600 hover:text-white"
-            >
-              Download
-            </a>
-          )}
-          <button
-            onClick={onClose}
-            className="rounded-lg bg-brand-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-brand-400"
+        {objectUrl && (
+          <a
+            href={objectUrl}
+            download="snip-qr-code.png"
+            className="mt-4 inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-3.5 py-2 text-xs font-medium text-text transition-colors hover:border-border-strong"
           >
-            Close
-          </button>
-        </div>
+            <Download className="h-3.5 w-3.5" />
+            Download PNG
+          </a>
+        )}
       </div>
-    </div>
+    </Dialog>
   )
 }

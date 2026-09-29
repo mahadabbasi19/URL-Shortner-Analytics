@@ -8,5 +8,13 @@ export default defineConfig({
   server: {
     host: true,
     port: 5173,
+    // Docker bind mounts on macOS (via virtiofs/colima) often don't deliver
+    // native filesystem change events into the container, so chokidar's
+    // default watcher silently misses edits made on the host. Polling
+    // trades a little CPU for hot reload actually working.
+    watch: {
+      usePolling: true,
+      interval: 300,
+    },
   },
 })
